@@ -8,10 +8,7 @@ import argparse
 from shutil import which
 import glob
 import subprocess
-import pprint
 import checkpyversion
-
-pp = pprint.PrettyPrinter(indent=4)
 
 def check_linux():
     if sys.platform != "linux" and sys.platform != "linux2":
