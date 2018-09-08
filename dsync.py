@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#Written by daltschu11 
+#Written by daltschu11 -- https://github.com/daltschu11
 
 import sys
 import os
@@ -26,10 +26,11 @@ def parse_arguments():
     parser.add_argument('--no-fpart', action='store_true', required=False, help='Run without fpart in basic mode (Chunks consist of top level files/dirs) \
         WARNING: BROKEN WITH RCLONE, ONLY TRANSFERS FILES!')
     #parser.add_argument('--fpart-options', action='store', required=False, help='Override the default fpart options (list those here)')
+    #parser.add_argument('--rsync-options', action='store', required=False, help='Override the default rsync options (list those here)')
     parser.add_argument('--source-hosts', action='store', required=False, help='Provide a file with a list of hosts you want to run the transfers to run on \
         (will evenly balance out the # of transfers with the number of hosts)')
-    # parser.add_argument('--destination-hosts', action='store', required=False, help='Provide a file with a list of hosts you want the transfers to run against \
-    #    (For example if you have a number of remote hosts with an NFS storage mount)')
+    parser.add_argument('--destination-hosts', action='store', required=False, help='Provide a file with a list of hosts you want the transfers to run against \
+        (For example if you have a number of remote hosts with an NFS storage mount)')
     parser.add_argument('--reuse', action='store_true', required=False, help='Reuse existing chunk files from same source, and same working directory')
     parser.add_argument('--cloud', action='store_true', required=False, help='Upload data to a cloud provider using rclone instead of local rsync')
     parser.add_argument('--rclone-config', type=str, action='store', required=False, help='Path to config file for rclone (Must contain proper config!)')
@@ -56,6 +57,54 @@ def parse_arguments():
         parser.exit()
 
     return parser.parse_args()
+
+class Fpart:
+    # Class for running fpart
+
+    def __init__(self):
+        self.check_fpart()
+
+    def check_fpart(self): #Check if fpart binary exists.
+        self.fpart_bin = which('fpart')
+        if self.fpart_bin is None:
+            print("ERROR: fpart not installed!")
+            sys.exit()
+
+    def run_fpart(self, fpart_command, source, log_dir): #Run fpart against the given path.
+        log_stdout_path = str(log_dir + 'fpart.out')
+        log_stderr_path = str(log_dir + 'fpart.err')
+        try:
+            with open(log_stdout_path, 'w') as out, open(log_stderr_path, 'w') as err:
+                process = subprocess.Popen(fpart_command, cwd=source, shell=True, stderr=err, stdout=out)
+                process.wait()
+        except subprocess.CalledProcessError:
+            print("ERROR: Something went wrong when running fpart!")
+            sys.exit()
+        except Exception as e:
+            print(e)
+            sys.exit()
+
+    def generate_chunks(self, file_ops, working_dir, thread_num, source, log_dir):
+        file_ops.delete_chunks(working_dir) #Delete existing chunks
+        # Assemble fpart arguments and run fpart
+        chunk_path = working_dir + 'chunk' 
+        fpart_command = ' '.join([
+            self.fpart_bin, 
+            '-Z', 
+            '-x .zfs -x .snapshot*', 
+            '-n %s' % (str(thread_num)), 
+            '-o', 
+            chunk_path, 
+            '.'
+        ])
+
+        self.run_fpart(fpart_command, source, log_dir) #Run fpart to create chunk files.
+
+        chunk_pattern = 'chunk*'
+        chunks = file_ops.list_files_byname(working_dir, chunk_pattern)
+        chunk_count = len(chunks)
+
+        return chunk_count, chunks
 
 class Rsync:
     # Class for running rsync
@@ -85,90 +134,57 @@ class Rsync:
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rsync.out.' + str(x))
             log_stderr_path = str(log_dir + 'rsync.err.' + str(x))
-
-            rsync_base_list = [
-                self.rsync_bin,
-                'copy',
-            ]
-
-            rsync_args_list = [
-                '-avv',
-                '--recursive',
-                '--files-from %s' % (chunk),
-            ]
-
-            rsync_source_dest = [
-                source,
-                dest
-            ]
+            
+            rsync_bin = self.rsync_bin
+            rsync_copy = 'copy'
+            rsync_flags = '-avv'
+            rsync_recursive = '--recursive'
+            rsync_files_from = '--files-from {}'.format(chunk)
+            rsync_source = source 
 
             if 'dry_run_yesno' in kwargs:
-                rsync_args_list.append('--dry-run')
-
-            if 'list_of_source_hosts' in kwargs:
-                list_of_source_hosts = kwargs.get('list_of_source_hosts')
-                rsync_command_list = [
-                    'ssh',
-                    list_of_source_hosts[x],
-                    "'"
-                ]
-                rsync_command_list.extend(rsync_base_list)
-                rsync_command_list.extend(rsync_args_list)
-                rsync_command_list.extend(rsync_source_dest)
-                rsync_command_list.append("'")
-
+                rsync_dry_run = '--dry-run'
             else:
-                rsync_command_list = rsync_base_list + rsync_args_list +rsync_source_dest
+                rsync_dry_run = ''
+            
+            if 'list_of_source_hosts' in kwargs: #Adds ssh formatting to rsync command string
+                list_of_source_hosts = kwargs.get('list_of_source_hosts')
+                source_host = list_of_source_hosts[x]
+                source_host_ssh_head = "ssh {} '".format(source_host)
+                source_host_ssh_tail = "'"
+            else:
+                source_host_ssh_head = ''
+                source_host_ssh_tail = ''
 
+            if 'list_of_dest_hosts' in kwargs:
+                list_of_dest_hosts = kwargs.get('list_of_dest_hosts')
+                rsync_dest_host = (list_of_dest_hosts[x])
+                rsync_dest = ''.join([ #Join the dest host with the dest path formatted for rsync/rclone
+                    rsync_dest_host, 
+                    ':', 
+                    dest
+                ])
+            else:
+                rsync_dest = dest
 
-            rsync_command = ' '.join(rsync_command_list)
+            rsync_command = ' '.join([
+                source_host_ssh_head,
+                rsync_bin,
+                rsync_copy,
+                rsync_flags,
+                rsync_recursive,
+                rsync_files_from,
+                rsync_dry_run,
+                rsync_source,
+                rsync_dest,
+                source_host_ssh_tail
+            ])
 
             # print('-- ' + rsync_command) # Used for testing if you dont want to actually run the commands
             self.run_rsync(rsync_command, log_dir, log_stdout_path, log_stderr_path)
             x += 1
 
             # subprocess.call(['ps -ef | grep /usr/bin/rsync | grep chunk | grep -v grep'], shell=True)
-
-class Fpart:
-    # Class for running fpart
-
-    def __init__(self):
-        self.check_fpart()
-
-    def check_fpart(self): #Check if fpart binary exists.
-        self.fpart_bin = which('fpart')
-        if self.fpart_bin is None:
-            print("ERROR: fpart not installed!")
-            sys.exit()
-
-    def run_fpart(self, fpart_command, source, log_dir): #Run fpart against the given path.
-        log_stdout_path = str(log_dir + 'fpart.out')
-        log_stderr_path = str(log_dir + 'fpart.err')
-        try:
-            with open(log_stdout_path, 'w') as out, open(log_stderr_path, 'w') as err:
-                process = subprocess.Popen(fpart_command, cwd=source, shell=True, stderr=err, stdout=out)
-                process.wait()
-        except subprocess.CalledProcessError:
-            print("ERROR: Something went wrong when running fpart!")
-            sys.exit()
-        except Exception as e:
-            print(e)
-            sys.exit()
-
-    def generate_chunks(self, file_ops, working_dir, thread_num, source, log_dir):
-        #Delete existing chunks
-        file_ops.delete_chunks(working_dir)
-        # Assemble fpart arguments and run fpart
-        chunk_path = working_dir + 'chunk' 
-        fpart_command = ' '.join([self.fpart_bin, '-Z', '-x .zfs -x .snapshot*', '-n', str(thread_num), '-o', chunk_path, '.'])
-
-        self.run_fpart(fpart_command, source, log_dir) #Run fpart to create chunk files.
-
-        chunk_pattern = 'chunk*'
-        chunks = file_ops.list_files_byname(working_dir, chunk_pattern)
-        chunk_count = len(chunks)
-
-        return chunk_count, chunks
 
 class Rclone:
     # Class for running rclone
@@ -199,43 +215,41 @@ class Rclone:
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rclone.out.' + str(x))
             log_stderr_path = str(log_dir + 'rclone.err.' + str(x))
-
-            rclone_base_list = [
-                self.rclone_bin,
-                'copy',
-            ]
-
-            rclone_args_list = [
-                '-vvv',
-                '--transfers',
-                str(self.threads),
-                '--files-from %s' % (chunk),
-            ]
-
-            rclone_source_dest = [
-                source,
-                dest
-            ]
+            
+            rclone_bin = self.rclone_bin
+            rclone_copy = 'copy'
+            rclone_flags = '-vvv'
+            rclone_transfers = '--transfers {}'.format(self.threads)
+            rclone_files_from = '--files-from {}'.format(chunk)
+            rclone_source = source
+            rclone_dest = dest
 
             if 'dry_run_yesno' in kwargs:
-                rclone_args_list.append('--dry-run')
-
-            if 'list_of_source_hosts' in kwargs:
-                list_of_source_hosts = kwargs.get('list_of_source_hosts')
-                rclone_command_list = [
-                    'ssh',
-                    list_of_source_hosts[x],
-                    "'"
-                ]
-                rclone_command_list.extend(rclone_base_list)
-                rclone_command_list.extend(rclone_args_list)
-                rclone_command_list.extend(rclone_source_dest)
-                rclone_command_list.append("'")
-
+                rclone_dry_run = '--dry-run'
             else:
-                rclone_command_list = rclone_base_list + rclone_args_list + rclone_source_dest
+                rclone_dry_run = ''
 
-            rclone_command = ' '.join(rclone_command_list)
+            if 'list_of_source_hosts' in kwargs: #Adds ssh formatting to rsync command string
+                list_of_source_hosts = kwargs.get('list_of_source_hosts')
+                source_host = list_of_source_hosts[x]
+                source_host_ssh_head = "ssh {} '".format(source_host)
+                source_host_ssh_tail = "'"
+            else:
+                source_host_ssh_head = ''
+                source_host_ssh_tail = ''
+
+            rclone_command = ' '.join([
+                source_host_ssh_head,
+                rclone_bin,
+                rclone_copy,
+                rclone_flags,
+                rclone_transfers,
+                rclone_files_from,
+                rclone_dry_run,
+                rclone_source,
+                rclone_dest,
+                source_host_ssh_tail
+            ])
 
             # print('-- ' + rclone_command) #Used for testing if you dont want to actually run the commands
             self.run_rclone(rclone_command, log_dir, log_stdout_path, log_stderr_path)
@@ -355,8 +369,8 @@ class Filesystem_Ops():
         chunk_count = 0
         true_false = False
         if chunks: #Check that there arent 0 chunks.
-            first_chunk_file = open(chunks[0], 'r')
-            if source in first_chunk_file.read(): #Check if the source directory is present inside the chunk file.
+            # first_chunk_file = open(chunks[0], 'r')#BROKEN?
+            # if source in first_chunk_file.read(): #Check if the source directory is present inside the chunk file.
                 chunk_count = len(chunks)
                 true_false = True
 
@@ -368,13 +382,12 @@ def main():
     checkpyversion.check_py_version() #Check that you are running python3
     check_linux() #Check that you are running on linux
 
-    file_ops = Filesystem_Ops()
+    file_ops = Filesystem_Ops() #Initialize filesystem ops class
 
     #Set variables from cmd line arguments
     source = file_ops.trailing_slash(file_ops.check_tilde(args.source))
     dest = file_ops.trailing_slash(file_ops.check_tilde(args.dest))
     thread_num = args.number
-    # remote = args.remote
     no_fpart = args.no_fpart
     reuse = args.reuse
     working_dir = file_ops.trailing_slash(file_ops.check_tilde(args.working_dir))
@@ -383,6 +396,7 @@ def main():
     rclone_config = args.rclone_config
     dry_run_yesno = args.dry_run
     source_hosts = args.source_hosts
+    dest_hosts = args.destination_hosts
 
     #Initialize fpart class.
     if not no_fpart:
@@ -394,7 +408,7 @@ def main():
     elif not to_cloud:
         rsync_class = Rsync()
 
-    print("Checking Paths...")
+    print("-- Checking Paths...")
     #Check if source exists, if not exit. 
     if not file_ops.check_path(source):
         print("ERROR: Source path does not exist!")
@@ -410,7 +424,7 @@ def main():
     if not file_ops.check_path(log_dir):
         file_ops.make_path(log_dir)
 
-    if not to_cloud: #Only run the destination check/creation if using rsync.
+    if not to_cloud or not dest_hosts: #Only run the destination check/creation if using rsync.
         if not file_ops.check_path(dest):
             file_ops.make_path(dest)
 
@@ -418,27 +432,31 @@ def main():
     if reuse: #If reuse is true, use existing chunk files
         reuse_true_false, chunk_count, chunks = file_ops.check_existing_chunks(working_dir, source) #If chunks exist, use those instead of generating.
         if reuse_true_false:
-            print("Reusing {0} existing chunk files... (Thread count will be changed to {0})".format(str(chunk_count)))
+            print("-- Reusing {0} existing chunk files... (Thread count will be changed to {0})".format(str(chunk_count)))
         elif not reuse_true_false:
-            print("The existing chunks dont match the source directory or dont exist!")
+            print("ERROR: The existing chunks dont match the source directory or dont exist!")
             sys.exit()
     else:
         if no_fpart: #Run without fpart (list files/dirs 2 dirs deep)
-            print("Breaking source directory into chunks...")
+            print("-- Breaking source directory into chunks...")
             chunks = file_ops.no_fpart_chunk_gen(working_dir, source, thread_num)
         if not no_fpart:
-            print("Running fpart to break source directory into chunks...")
+            print("-- Running fpart to break source directory into chunks...")
             chunk_count, chunks = fpart_class.generate_chunks(file_ops, working_dir, thread_num, source, log_dir) #Generate chunks.
 
     if source_hosts: #Get a list of the source hosts
-        print("Using a list of source hosts...")
+        print("-- Using a list of source hosts...")
         list_of_source_hosts = file_ops.read_file_into_list(source_hosts)
+
+    if dest_hosts:
+        print("-- Using a list of destination hosts...")
+        list_of_dest_hosts = file_ops.read_file_into_list(dest_hosts)
 
     if dry_run_yesno: #Warn the user that no files will be transferred
         print("WARNING: --dry-run used (NO FILES WILL ACTUALLY BE TRANSFERRED!)")
 
     if to_cloud: #If you are running a cloud transfer
-        print("Using rclone...")
+        print("-- Using rclone...")
         rclone_class.rclone_config_file=rclone_config #Add the rclone config file to the class
 
         print("     + Testing rclone write permissions to bucket")
@@ -458,28 +476,17 @@ def main():
         rclone_class.sync_chunks(chunks, source, dest, log_dir, **rclone_optional_args)
         
     else: #If you are running a local transfer
-        print("Using rsync...")
+        print("-- Using rsync...")
         print("     + Running rsync's...")
         rsync_optional_args = {} #kwargs dictionary for any optional stuff
         if dry_run_yesno:
             rsync_optional_args.update({"dry_run_yesno" : dry_run_yesno}) #Add dry run flag to kwargs
         if source_hosts:
             rsync_optional_args.update({"list_of_source_hosts" : list_of_source_hosts}) #Add list of source hosts to kwargs
+        if dest_hosts:
+            rsync_optional_args.update({"list_of_dest_hosts" : list_of_dest_hosts}) #Add list of dest hosts to kwargs
 
         rsync_class.sync_chunks(chunks, source, dest, log_dir, **rsync_optional_args) #Run rsync
-
-
-
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
 
 
 
