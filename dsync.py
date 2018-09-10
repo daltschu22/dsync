@@ -136,7 +136,7 @@ class Rsync:
             log_stderr_path = str(log_dir + 'rsync.err.' + str(x))
             
             rsync_bin = self.rsync_bin
-            rsync_flags = '-avv'
+            rsync_flags = '-av'
             rsync_recursive = '--recursive'
             rsync_files_from = '--files-from {}'.format(chunk)
             rsync_source = source 
