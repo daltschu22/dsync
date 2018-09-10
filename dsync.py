@@ -136,7 +136,6 @@ class Rsync:
             log_stderr_path = str(log_dir + 'rsync.err.' + str(x))
             
             rsync_bin = self.rsync_bin
-            rsync_copy = 'copy'
             rsync_flags = '-avv'
             rsync_recursive = '--recursive'
             rsync_files_from = '--files-from {}'.format(chunk)
@@ -170,7 +169,6 @@ class Rsync:
             rsync_command = ' '.join([
                 source_host_ssh_head,
                 rsync_bin,
-                rsync_copy,
                 rsync_flags,
                 rsync_recursive,
                 rsync_files_from,
