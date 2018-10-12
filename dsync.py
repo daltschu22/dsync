@@ -264,7 +264,7 @@ class Rclone:
         log_stdout_path = str(log_dir + 'check_write_perms.out')
         log_stderr_path = str(log_dir + 'check_write_perms.err')
         test_file_path = str(dest + 'testfile.dsync')
-        rclone_command = ' '.join([self.rclone_bin, 'touch', '-vvv', test_file_path])
+        rclone_command = ' '.join([self.rclone_bin, 'touch', '-v', test_file_path])
 
         self.run_rclone(rclone_command, log_dir, log_stdout_path, log_stderr_path)
 
@@ -275,7 +275,7 @@ class Rclone:
         print("     + Removing test file")
         log_stdout_path = str(log_dir + 'cleanup_write_perms.out')
         log_stderr_path = str(log_dir + 'cleanup_write_perms.err')
-        rclone_command = ' '.join([self.rclone_bin, 'deletefile', '-vv', test_file_path])
+        rclone_command = ' '.join([self.rclone_bin, 'deletefile', '-v', test_file_path])
 
         self.run_rclone(rclone_command, log_dir, log_stdout_path, log_stderr_path)
 

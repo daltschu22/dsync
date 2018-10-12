@@ -14,7 +14,7 @@ rsync(https://rsync.samba.org/)
 rclone(rclone.org)
 ```
 
-### Installing and Configuring
+## Installing and Configuring
 
 Clone the repo or download the necessary files.
 ```
@@ -28,7 +28,7 @@ Rsync should already be installed on most linux systems.
 Fpart instructions can be found in the README: https://github.com/martymac/fpart/blob/master/README
 rclone installation instructions can be found here: https://rclone.org/downloads/
 
-## Configuring rclone
+### Configuring rclone
 
 You need to have an endpoint configured if you plan on running dsync with rclone.
 
@@ -70,7 +70,7 @@ q) Quit config
 e/n/d/r/c/s/q> n
 ```
 
-### Running dsync
+## Running dsync
 
 dsync is run with a defined number of threads, a source, and a destination. These are the required arguments. 
  If defaults are used, the working directory that dsync uses to store working files is ~/dsync_working/.
