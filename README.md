@@ -1,5 +1,5 @@
 # dsync
-dsync is a python script developed to move data, fast. It utilizes fpart(https://github.com/martymac/fpart) to break apart the source directory so that a copy can be run accross multiple instances of rsync(https://rsync.samba.org/) or rclone(rclone.org) on a single, or multiple hosts.
+dsync is a python script developed to move data, fast. It utilizes fpart(https://github.com/martymac/fpart) to break apart the source directory so that a copy can be run accross multiple instances of rsync(https://rsync.samba.org/) or rclone(https://rclone.org) on a single, or multiple hosts.
 
 ## Getting Started
 
@@ -11,7 +11,7 @@ These are the requirements and necessary steps in order to get you up and runnin
 Python 3+
 fpart (https://github.com/martymac/fpart)
 rsync(https://rsync.samba.org/)
-rclone(rclone.org)
+rclone(https://rclone.org)
 ```
 
 ## Installing and Configuring
