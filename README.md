@@ -90,7 +90,7 @@ dsync can be pointed towards a cloud location by using the `--cloud` flag.
  This will launch dsync using rclone as the transfer tool. Please define your cloud endpoints in the rclone config file before running.
  You can also feed rclone a config file using `--rclone-config` otherwise it will default to `~/.config/rclone/rclone.conf`.
 
-fpart can be skipped by using --no-fpart. This will perform a rudimentary chunking of the top level directories of the source path. '
+fpart can be skipped by using --no-fpart. This will perform a rudimentary chunking of the top level directories of the source path.
 
 You can run rsync or clone in dry run mode using the flag `--dry-run`
 
