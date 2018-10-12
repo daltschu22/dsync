@@ -33,8 +33,15 @@ def parse_arguments():
         (For example if you have a number of remote hosts with an NFS storage mount)')
     parser.add_argument('--reuse', action='store_true', required=False, help='Reuse existing chunk files from same source, and same working directory')
     parser.add_argument('--cloud', action='store_true', required=False, help='Upload data to a cloud provider using rclone instead of local rsync')
-    parser.add_argument('--rclone-config', type=str, action='store', required=False, help='Path to config file for rclone (Must contain proper config!)')
     parser.add_argument('--dry-run', action='store_true', required=False, help='Run rclone or rsync in dry run mode (Wont actually copy anything)')
+    parser.add_argument(
+        '--rclone-config', 
+        type=str, 
+        action='store', 
+        required=False, 
+        default=os.path.expanduser('~/.config/rclone/rclone.conf'),
+        help='Path to config file for rclone (If not defined, will default to ~/.config/rclone/rclone.conf)'
+        )
     parser.add_argument(
         '--working-dir',
         action='store',
@@ -216,7 +223,7 @@ class Rclone:
             
             rclone_bin = self.rclone_bin
             rclone_copy = 'copy'
-            rclone_flags = '-vvv'
+            rclone_flags = '-v'
             rclone_transfers = '--transfers {}'.format(self.threads)
             rclone_files_from = '--files-from {}'.format(chunk)
             rclone_source = source
