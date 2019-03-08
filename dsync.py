@@ -125,7 +125,7 @@ class Rsync:
             print("ERROR: rsync not installed!")
             sys.exit()
 
-    def run_rsync(self, rsync_command, log_dir, log_stdout_path, log_stderr_path): #Run rsync with given paths.
+    def run_rsync(self, rsync_command, log_dir, log_stdout_path, log_stderr_path): # Run rsync with given paths.
         try:
             with open(log_stdout_path, 'w') as out, open(log_stderr_path, 'w') as err:
                 subprocess.Popen(rsync_command, shell=True, stdout=out, stderr=err)
@@ -136,7 +136,7 @@ class Rsync:
             print(e)
             sys.exit()
 
-    def sync_chunks(self, chunks, source, dest, log_dir, **kwargs): #Run through chunks from fpart and pass to run_rsync() to be ran. 
+    def sync_chunks(self, chunks, source, dest, log_dir, rsync_optional_args): # Run through chunks from fpart and pass to run_rsync() to be ran. 
         x = 0
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rsync.out.' + str(x))
@@ -148,13 +148,13 @@ class Rsync:
             rsync_files_from = '--files-from {}'.format(chunk)
             rsync_source = source 
 
-            if 'dry_run_yesno' in kwargs:
+            if 'dry_run_yesno' in rsync_optional_args:
                 rsync_dry_run = '--dry-run'
             else:
                 rsync_dry_run = ''
             
-            if 'list_of_source_hosts' in kwargs: #Adds ssh formatting to rsync command string
-                list_of_source_hosts = kwargs.get('list_of_source_hosts')
+            if 'list_of_source_hosts' in rsync_optional_args: # Adds ssh formatting to rsync command string
+                list_of_source_hosts = rsync_optional_args.get('list_of_source_hosts')
                 source_host = list_of_source_hosts[x]
                 source_host_ssh_head = "ssh {} '".format(source_host)
                 source_host_ssh_tail = "'"
@@ -162,10 +162,10 @@ class Rsync:
                 source_host_ssh_head = ''
                 source_host_ssh_tail = ''
 
-            if 'list_of_dest_hosts' in kwargs:
-                list_of_dest_hosts = kwargs.get('list_of_dest_hosts')
+            if 'list_of_dest_hosts' in rsync_optional_args:
+                list_of_dest_hosts = rsync_optional_args.get('list_of_dest_hosts')
                 rsync_dest_host = (list_of_dest_hosts[x])
-                rsync_dest = ''.join([ #Join the dest host with the dest path formatted for rsync/rclone
+                rsync_dest = ''.join([ # Join the dest host with the dest path formatted for rsync/rclone
                     rsync_dest_host, 
                     ':', 
                     dest
@@ -215,7 +215,7 @@ class Rclone:
             print(e)
             sys.exit()
 
-    def sync_chunks(self, chunks, source, dest, log_dir, **kwargs):
+    def sync_chunks(self, chunks, source, dest, log_dir, rclone_optional_args):
         x = 0
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rclone.out.' + str(x))
@@ -229,13 +229,13 @@ class Rclone:
             rclone_source = source
             rclone_dest = dest
 
-            if 'dry_run_yesno' in kwargs:
+            if 'dry_run_yesno' in rclone_optional_args:
                 rclone_dry_run = '--dry-run'
             else:
                 rclone_dry_run = ''
 
-            if 'list_of_source_hosts' in kwargs: #Adds ssh formatting to rsync command string
-                list_of_source_hosts = kwargs.get('list_of_source_hosts')
+            if 'list_of_source_hosts' in rclone_optional_args: #Adds ssh formatting to rsync command string
+                list_of_source_hosts = rclone_optional_args.get('list_of_source_hosts')
                 source_host = list_of_source_hosts[x]
                 source_host_ssh_head = "ssh {} '".format(source_host)
                 source_host_ssh_tail = "'"
@@ -472,26 +472,26 @@ def main():
             rclone_class.clean_fpart_chunks(chunks)
 
         print("     + Running rclone's...")
-        rclone_optional_args = {} #kwargs dictionary for any optional stuff
+        rclone_optional_args = {} # dictionary for any optional stuff
         if dry_run_yesno:
-            rclone_optional_args.update({"dry_run_yesno" : dry_run_yesno}) #Add dry run flag to kwargs
+            rclone_optional_args.update({"dry_run_yesno" : dry_run_yesno}) #Add dry run flag to dict
         if source_hosts:
-            rclone_optional_args.update({"list_of_source_hosts" : list_of_source_hosts}) #Add list of source hosts to kwargs
+            rclone_optional_args.update({"list_of_source_hosts" : list_of_source_hosts}) #Add list of source hosts to dict
 
-        rclone_class.sync_chunks(chunks, source, dest, log_dir, **rclone_optional_args)
+        rclone_class.sync_chunks(chunks, source, dest, log_dir, rclone_optional_args)
         
     else: #If you are running a local transfer
         print("-- Using rsync...")
         print("     + Running rsync's...")
-        rsync_optional_args = {} #kwargs dictionary for any optional stuff
+        rsync_optional_args = {} # dictionary for any optional stuff
         if dry_run_yesno:
-            rsync_optional_args.update({"dry_run_yesno" : dry_run_yesno}) #Add dry run flag to kwargs
+            rsync_optional_args.update({"dry_run_yesno" : dry_run_yesno}) #Add dry run flag to dict
         if source_hosts:
-            rsync_optional_args.update({"list_of_source_hosts" : list_of_source_hosts}) #Add list of source hosts to kwargs
+            rsync_optional_args.update({"list_of_source_hosts" : list_of_source_hosts}) #Add list of source hosts to dict
         if dest_hosts:
-            rsync_optional_args.update({"list_of_dest_hosts" : list_of_dest_hosts}) #Add list of dest hosts to kwargs
+            rsync_optional_args.update({"list_of_dest_hosts" : list_of_dest_hosts}) #Add list of dest hosts to dict
 
-        rsync_class.sync_chunks(chunks, source, dest, log_dir, **rsync_optional_args) #Run rsync
+        rsync_class.sync_chunks(chunks, source, dest, log_dir, rsync_optional_args) #Run rsync
 
 
 
