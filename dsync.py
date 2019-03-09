@@ -325,7 +325,7 @@ class Filesystem_Ops():
 
     def trailing_slash(self, dir_path): # Check if path has trailing slash, if it doesnt, add one.
         dir_path = os.path.join(dir_path, '')
-        
+
         return dir_path
 
     def list_files_byname(self, dir_path, pattern): # List all files in a directory that match pattern.
@@ -384,13 +384,14 @@ class Filesystem_Ops():
     def check_existing_chunks(self, working_dir, source): #Check if chunks already exist. 
         chunk_pattern = 'chunk*'
         chunks = self.list_files_byname(working_dir, chunk_pattern)
-        chunk_count = 0
-        true_false = False
         if chunks: #Check that there arent 0 chunks.
             # first_chunk_file = open(chunks[0], 'r')#BROKEN?
             # if source in first_chunk_file.read(): #Check if the source directory is present inside the chunk file.
-                chunk_count = len(chunks)
-                true_false = True
+            chunk_count = len(chunks)
+            true_false = True
+        else:
+            chunk_count = 0
+            true_false = False
 
         return true_false, chunk_count, chunks
 
