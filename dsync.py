@@ -9,6 +9,7 @@ from shutil import which
 import glob
 import subprocess
 import checkpyversion
+import itertools
 
 def check_linux():
     if sys.platform != "linux" and sys.platform != "linux2":
@@ -138,6 +139,15 @@ class Rsync:
 
     def sync_chunks(self, chunks, source, dest, log_dir, rsync_optional_args): # Run through chunks from fpart and pass to run_rsync() to be ran. 
         x = 0
+
+        if 'list_of_source_hosts' in rsync_optional_args: #Adds ssh formatting to rsync command string
+            list_of_source_hosts = rsync_optional_args.get('list_of_source_hosts')
+            round_robin_source_hosts = itertools.cycle(list_of_source_hosts)
+
+        if 'list_of_dest_hosts' in rsync_optional_args:
+            list_of_dest_hosts = rsync_optional_args.get('list_of_dest_hosts')
+            round_robin_dest_hosts = itertools.cycle(list_of_dest_hosts)
+
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rsync.out.' + str(x))
             log_stderr_path = str(log_dir + 'rsync.err.' + str(x))
@@ -154,8 +164,7 @@ class Rsync:
                 rsync_dry_run = ''
             
             if 'list_of_source_hosts' in rsync_optional_args: # Adds ssh formatting to rsync command string
-                list_of_source_hosts = rsync_optional_args.get('list_of_source_hosts')
-                source_host = list_of_source_hosts[x]
+                source_host = next(round_robin_source_hosts) # Round robins the list of hosts
                 source_host_ssh_head = "ssh {} '".format(source_host)
                 source_host_ssh_tail = "'"
             else:
@@ -163,8 +172,7 @@ class Rsync:
                 source_host_ssh_tail = ''
 
             if 'list_of_dest_hosts' in rsync_optional_args:
-                list_of_dest_hosts = rsync_optional_args.get('list_of_dest_hosts')
-                rsync_dest_host = (list_of_dest_hosts[x])
+                rsync_dest_host = next(round_robin_dest_hosts) # Round robins the list of hosts
                 rsync_dest = ''.join([ # Join the dest host with the dest path formatted for rsync/rclone
                     rsync_dest_host, 
                     ':', 
@@ -198,7 +206,7 @@ class Rclone:
         self.check_rclone()
         self.threads = 2
 
-    def check_rclone(self): #Check if rclone binary exists.
+    def check_rclone(self): # Check if rclone binary exists.
         self.rclone_bin = which('rclone')
         if self.rclone_bin is None:
             print("ERROR: rclone not installed!")
@@ -217,6 +225,11 @@ class Rclone:
 
     def sync_chunks(self, chunks, source, dest, log_dir, rclone_optional_args):
         x = 0
+
+        if 'list_of_source_hosts' in rclone_optional_args: # Adds ssh formatting to rsync command string
+            list_of_source_hosts = rclone_optional_args.get('list_of_source_hosts')
+            round_robin_source_hosts = itertools.cycle(list_of_source_hosts)
+
         for chunk in chunks:
             log_stdout_path = str(log_dir + 'rclone.out.' + str(x))
             log_stderr_path = str(log_dir + 'rclone.err.' + str(x))
@@ -234,9 +247,8 @@ class Rclone:
             else:
                 rclone_dry_run = ''
 
-            if 'list_of_source_hosts' in rclone_optional_args: #Adds ssh formatting to rsync command string
-                list_of_source_hosts = rclone_optional_args.get('list_of_source_hosts')
-                source_host = list_of_source_hosts[x]
+            if 'list_of_source_hosts' in rclone_optional_args: # Adds ssh formatting to rsync command string
+                source_host = next(round_robin_source_hosts) # Round robins the list of hosts
                 source_host_ssh_head = "ssh {} '".format(source_host)
                 source_host_ssh_tail = "'"
             else:
@@ -260,7 +272,7 @@ class Rclone:
             self.run_rclone(rclone_command, log_dir, log_stdout_path, log_stderr_path)
             x += 1
 
-    def test_write_perms(self, dest, log_dir): #Touches a file to remote to check permissions so you can fail before kicking off all the rclones
+    def test_write_perms(self, dest, log_dir): # Touches a file to remote to check permissions so you can fail before kicking off all the rclones
         log_stdout_path = str(log_dir + 'check_write_perms.out')
         log_stderr_path = str(log_dir + 'check_write_perms.err')
         test_file_path = str(dest + 'testfile.dsync')
@@ -268,10 +280,10 @@ class Rclone:
 
         self.run_rclone(rclone_command, log_dir, log_stdout_path, log_stderr_path)
 
-        #Cleanup test file
+        # Cleanup test file
         self.cleanup_write_perms_test(dest, log_dir, test_file_path)
 
-    def cleanup_write_perms_test(self, dest, log_dir, test_file_path): #Cleanup test touch file
+    def cleanup_write_perms_test(self, dest, log_dir, test_file_path): # Cleanup test touch file
         print("     + Removing test file")
         log_stdout_path = str(log_dir + 'cleanup_write_perms.out')
         log_stderr_path = str(log_dir + 'cleanup_write_perms.err')
@@ -288,7 +300,7 @@ class Rclone:
 class Filesystem_Ops():
     # Class for running various filesystem operations
     
-    def make_path(self, make_dir): #Check if the path exists and if not, create it. 
+    def make_path(self, make_dir): # Check if the path exists and if not, create it. 
         try:
             print('     + ' + make_dir + " does not exist. making...")
             os.makedirs(make_dir)
@@ -299,23 +311,24 @@ class Filesystem_Ops():
                 print(e)
             sys.exit()
 
-    def check_path(self, dir_path): #Check if the path exists, if it does return True, if it doesnt return False.
+    def check_path(self, dir_path): # Check if the path exists, if it does return True, if it doesnt return False.
         if os.path.exists(dir_path):
             return True
         else:
             return False
 
-    def check_tilde(self, dir_path): #Check if path starts with '~'. If so, expand it.
+    def check_tilde(self, dir_path): # Check if path starts with '~'. If so, expand it.
         if dir_path.startswith('~'):
             dir_path = os.path.expanduser(dir_path)
 
         return dir_path
 
-    def trailing_slash(self, dir_path): #Check if path has trailing slash, if it doesnt, add one.
+    def trailing_slash(self, dir_path): # Check if path has trailing slash, if it doesnt, add one.
         dir_path = os.path.join(dir_path, '')
+        
         return dir_path
 
-    def list_files_byname(self, dir_path, pattern): #List all files in a directory that match pattern.
+    def list_files_byname(self, dir_path, pattern): # List all files in a directory that match pattern.
         glob_name = dir_path + pattern
         file_list = glob.glob(glob_name)
 
@@ -349,7 +362,7 @@ class Filesystem_Ops():
             os.remove(chunk)
 
     def no_fpart_chunk_gen(self, working_dir, source, thread_num):
-        depth = '*' #Setting a default of 1 levels deep just for now
+        depth = '*' # Setting a default of 1 levels deep just for now
         path = str(source + depth)
         file_list = [os.path.basename(x) for x in glob.glob(path)]
 
@@ -400,8 +413,8 @@ def main():
     to_cloud = args.cloud
     rclone_config = args.rclone_config
     dry_run_yesno = args.dry_run
-    source_hosts = args.source_hosts
-    dest_hosts = args.destination_hosts
+    source_hosts = file_ops.check_tilde(args.source_hosts)
+    dest_hosts = file_ops.check_tilde(args.destination_hosts)
 
     #Initialize fpart class.
     if not no_fpart:
