@@ -28,9 +28,9 @@ def parse_arguments():
         WARNING: BROKEN WITH RCLONE, ONLY TRANSFERS FILES!')
     # parser.add_argument('--fpart-options', action='store', required=False, help='Override the default fpart options (list those here)')
     # parser.add_argument('--rsync-options', action='store', required=False, help='Override the default rsync options (list those here)')
-    parser.add_argument('--source-hosts', action='store', required=False, help='Provide a file with a list of hosts you want to run the transfers to run on \
+    parser.add_argument('--source-hosts', default=None, action='store', required=False, help='Provide a file with a list of hosts you want to run the transfers to run on \
         (will evenly balance out the # of transfers with the number of hosts)')
-    parser.add_argument('--destination-hosts', action='store', required=False, help='Provide a file with a list of hosts you want the transfers to run against \
+    parser.add_argument('--destination-hosts', default=None, action='store', required=False, help='Provide a file with a list of hosts you want the transfers to run against \
         (For example if you have a number of remote hosts with an NFS storage mount)')
     parser.add_argument('--reuse', action='store_true', required=False, help='Reuse existing chunk files from same source, and same working directory')
     parser.add_argument('--cloud', action='store_true', required=False, help='Upload data to a cloud provider using rclone instead of local rsync')
@@ -318,13 +318,15 @@ class Filesystem_Ops():
             return False
 
     def check_tilde(self, dir_path):  # Check if path starts with '~'. If so, expand it.
-        if dir_path.startswith('~'):
-            dir_path = os.path.expanduser(dir_path)
+        if dir_path:
+            if dir_path.startswith('~'):
+                dir_path = os.path.expanduser(dir_path)
 
         return dir_path
 
     def trailing_slash(self, dir_path):  # Check if path has trailing slash, if it doesnt, add one.
-        dir_path = os.path.join(dir_path, '')
+        if dir_path:
+            dir_path = os.path.join(dir_path, '')
 
         return dir_path
 
@@ -414,11 +416,9 @@ def main():
     to_cloud = args.cloud
     rclone_config = args.rclone_config
     dry_run_yesno = args.dry_run
-    
-    if args.source_host:
+    if args.source_hosts:
         source_hosts = file_ops.check_tilde(args.source_hosts)
-
-    if args.destination_hosts:    
+    if args.destination_hosts:
         dest_hosts = file_ops.check_tilde(args.destination_hosts)
 
     # Initialize fpart class.
