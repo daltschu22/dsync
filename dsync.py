@@ -414,8 +414,12 @@ def main():
     to_cloud = args.cloud
     rclone_config = args.rclone_config
     dry_run_yesno = args.dry_run
-    source_hosts = file_ops.check_tilde(args.source_hosts)
-    dest_hosts = file_ops.check_tilde(args.destination_hosts)
+    
+    if args.source_host:
+        source_hosts = file_ops.check_tilde(args.source_hosts)
+
+    if args.destination_hosts:    
+        dest_hosts = file_ops.check_tilde(args.destination_hosts)
 
     # Initialize fpart class.
     if not no_fpart:
