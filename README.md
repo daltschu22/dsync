@@ -1,155 +1,213 @@
 # dsync
-dsync is a python script developed to move data, fast. It utilizes fpart(https://github.com/martymac/fpart) to break apart the source directory so that a copy can be run accross multiple instances of rsync(https://rsync.samba.org/) or rclone(https://rclone.org) on a single, or multiple hosts.
 
-## Getting Started
+dsync partitions a local directory and copies its contents using parallel
+[rsync](https://rsync.samba.org/) or [rclone](https://rclone.org/) processes.
+[fpart](https://www.fpart.org/) balances chunks by size; basic chunking is also
+available without fpart. Transfers can run locally or across SSH worker hosts
+that share access to the source filesystem.
 
-These are the requirements and necessary steps in order to get you up and running with dsync.
+## Requirements
 
-### Requirements and prerequisites
+- Linux and Python 3.10 or later. No Python packages are required.
+- rsync for filesystem transfers, or rclone for `--cloud` transfers.
+- fpart unless using `--no-fpart` or reusing existing chunks.
+- SSH with noninteractive authentication when using worker or destination hosts.
 
-```
-Python 3+
-fpart (https://github.com/martymac/fpart)
-rsync(https://rsync.samba.org/)
-rclone(https://rclone.org)
-```
-
-## Installing and Configuring
-
-Clone the repo or download the necessary files.
-```
-git clone https://github.com/daltschu11/dsync.git
-
+```sh
+git clone https://github.com/daltschu22/dsync.git
+cd dsync
+python3 dsync.py --help
 ```
 
-Install fpart, rsync, and rclone if using one or all.
- 
-Rsync should already be installed on most linux systems. 
-Fpart instructions can be found in the README: https://github.com/martymac/fpart/blob/master/README
-rclone installation instructions can be found here: https://rclone.org/downloads/
+Install the external tools through your distribution, for example:
 
-### Configuring rclone
-
-You need to have an endpoint configured if you plan on running dsync with rclone.
-
-The documentation for that is here: https://rclone.org/commands/rclone_config/
-But, its fairly simple.
-
-And example of a section of the config file for a Google Cloud Storage configuration is here: 
-```
-[google-cloud-bucket-1]
-type = google cloud storage
-client_id =
-client_secret =
-project_number =
-service_account_file = /path/to/my/json-file.json
-object_acl =
-bucket_acl =
-location = us
-storage_class = COLDLINE
+```sh
+sudo apt install rsync fpart rclone
 ```
 
-Or you can run through the config interactively and select n for new config:
+## Usage
 
-```
-$ rclone config
-Current remotes:
+Copy the **contents** of a directory with up to four concurrent processes:
 
-Name                 Type
-====                 ====
-
-
-e) Edit existing remote
-n) New remote
-d) Delete remote
-r) Rename remote
-c) Copy remote
-s) Set configuration password
-q) Quit config
-
-e/n/d/r/c/s/q> n
+```sh
+python3 dsync.py /mnt/source /mnt/destination -n 4
 ```
 
-## Running dsync
+Use basic chunking, including hidden files and directories:
 
-dsync is run with a defined number of threads, a source, and a destination. These are the required arguments. 
- If defaults are used, the working directory that dsync uses to store working files is ~/dsync_working/.
- If defaults are used, the log directory is stored inside the working directory.
- dsync will default to using rsync (For local NFS transfers).
- dsync will also default to using fpart to chunk out the source directory. 
-
-Default flags for rsync is `-av` which means rsync runs in `archive` mode. 
-Default flags for rclone is `-v`. rclone will default to using the `copy` command. Which means source data will only be copied, not moved or deleted. 
-Fpart will default to ignoring `.zfs` and `.snapshot*` directories.
-
-If dsync is run again with the same source directory, it will rerun the chunking process. 
- Dont forget to add the `--reuse` flag in order to reuse the stored chunk files if you dont want to rerun the chunking.
-
-dsync can be pointed towards a cloud location by using the `--cloud` flag. 
- Your destination will need to follow the rclone convention of `configured-endpoint:bucket/path/path`
- This will launch dsync using rclone as the transfer tool. Please define your cloud endpoints in the rclone config file before running.
- You can also feed rclone a config file using `--rclone-config` otherwise it will default to `~/.config/rclone/rclone.conf`.
-
-fpart can be skipped by using --no-fpart. This will perform a rudimentary chunking of the top level directories of the source path.
-
-You can run rsync or clone in dry run mode using the flag `--dry-run`
-
-
-If you run dsync with the `-h` flag you will get the usage:
+```sh
+python3 dsync.py /mnt/source /mnt/destination -n 4 --no-fpart
 ```
-uusage: dsync.py [-h] -n NUMBER [--no-fpart] [--source-hosts SOURCE_HOSTS]
-                [--destination-hosts DESTINATION_HOSTS] [--reuse] [--cloud]
-                [--dry-run] [--rclone-config RCLONE_CONFIG]
-                [--working-dir /working/dir/] [--log-output /log/dir/]
-                /source/path/ /destination/path/ OR
-                cloud-prefix:bucket-name/path/in/bucket/
 
-Uses fpart to bag up filesystems into defined chunks, then transfers them
-using rsync/rclone either on a single host
+With rsync, basic chunks contain top-level entries and each transfer recurses
+into its assigned directories. With rclone, basic chunking walks the source
+recursively and distributes file paths across chunks. It streams the listing
+to disk instead of retaining the whole tree in memory. For uneven directory
+sizes, fpart generally provides better load balancing. Both modes exclude
+`.zfs` and names beginning with `.snapshot` at every level.
 
-positional arguments:
-  /source/path/         Source path -- use absolute paths! (dsync always
-                        behaves as if you used a trailing slash in rsync!)
-  /destination/path/ OR cloud-prefix:bucket-name/path/in/bucket/
-                        Destination path -- use absolute paths!
+Upload using an endpoint created with [`rclone config`](https://rclone.org/commands/rclone_config/):
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -n NUMBER, --number NUMBER
-                        Pack files into <num> chunks and kickoff <num>
-                        transfers
-  --no-fpart            Run without fpart in basic mode (Chunks consist of top
-                        level files/dirs) WARNING: BROKEN WITH RCLONE, ONLY
-                        TRANSFERS FILES!
-  --source-hosts SOURCE_HOSTS
-                        Provide a file with a list of hosts you want to run
-                        the transfers to run on (will evenly balance out the #
-                        of transfers with the number of hosts)
-  --destination-hosts DESTINATION_HOSTS
-                        Provide a file with a list of hosts you want the
-                        transfers to run against (For example if you have a
-                        number of remote hosts with an NFS storage mount)
-  --reuse               Reuse existing chunk files from same source, and same
-                        working directory
-  --cloud               Upload data to a cloud provider using rclone instead
-                        of local rsync
-  --dry-run             Run rclone or rsync in dry run mode (Wont actually
-                        copy anything)
-  --rclone-config RCLONE_CONFIG
-                        Path to config file for rclone (If not defined, will
-                        default to ~/.config/rclone/rclone.conf)
-  --working-dir /working/dir/
-                        Directory in which temp files will be stored while
-                        running (default is your home dir ~/dsync_working/)
-  --log-output /log/dir/
-                        location for the log files (Default is in the working
-                        directory ~/dsync_working/logs/)
+```sh
+python3 dsync.py /mnt/source remote:bucket/path -n 4 --cloud \
+  --rclone-config ~/.config/rclone/rclone.conf
 ```
+
+`--cloud` uses `rclone copy`, with two file transfers per process. Local rclone
+destinations are also supported. Rsync uses archive mode. Neither backend
+deletes destination files to mirror the source.
+
+Preview a transfer with `--dry-run`. It still creates local chunks and logs,
+but does not create the destination or perform cloud write/delete probes:
+
+```sh
+python3 dsync.py /mnt/source remote:bucket/path -n 4 --cloud --dry-run
+```
+
+The command waits for all transfers. Any partitioning or transfer failure
+returns a nonzero exit status and identifies the relevant error log. Ctrl+C
+and SIGTERM stop active local partition/transfer process groups before exiting
+with status 130 and 143 respectively. Cleanup waits up to five seconds before
+killing surviving group members, even if their parent has exited. Further
+interruptions during cleanup do not abandon the remaining processes. Remote
+worker cleanup depends on SSH and the remote tool's disconnect behavior.
+
+## Working files, logs, and reuse
+
+The default working directory is `~/dsync_working`. Logs default to its `logs`
+subdirectory; override these with `--working-dir` and `--log-output`.
+Working/log directories must not overlap the source or a local destination.
+Local source and destination trees must also be disjoint.
+
+The working directory reserves `chunks/`, `manifest.json`, and `.dsync.lock`.
+Only one run can use it at a time. Use separate working **and log** directories
+for independent simultaneous runs. Logs are overwritten on subsequent runs.
+Chunk generation is staged so a partitioning failure preserves the previous
+completed chunk set. Regeneration replaces only unchanged chunk files recorded
+in a valid manifest. Unrecognized files, modified chunks, and symlinked chunk
+directories cause an error and are preserved, including during dry runs. Use
+a new working directory or move those files aside after reviewing them. An
+interrupted replacement may also require a new working directory.
+
+Reuse a successful partition without rescanning the source:
+
+```sh
+python3 dsync.py /mnt/source /mnt/destination -n 2 --reuse
+```
+
+Reuse verifies the source path and filesystem identity, backend, chunking
+mode, and chunk checksums. Repeat `--cloud` and/or `--no-fpart` if used during
+generation. `-n` still caps concurrent processes, even if more chunks exist.
+Legacy chunks without a manifest must be regenerated once.
+
+Reuse does **not** discover new files within the source tree. Regenerate chunks
+when files are added or removed. Before each cloud chunk is copied, a Python
+check on the transfer host verifies that all listed source entries exist and
+spools the list to a temporary file. Missing entries fail that chunk instead
+of being silently skipped by rclone. This adds a metadata lookup per entry
+and temporary disk space for the list, and cannot prevent changes after the
+check. Use a stable source snapshot when consistency is required.
+
+## Multiple hosts
+
+Host files contain one hostname or `user@hostname` per line. Blank lines and
+lines beginning with `#` are ignored. Hosts are assigned round-robin.
+
+```sh
+python3 dsync.py /mnt/source /mnt/destination -n 8 \
+  --source-hosts workers.txt --destination-hosts storage.txt
+```
+
+- Source workers must see the same absolute source path and have the transfer
+  tool on their `PATH`. Chunk contents are sent over SSH stdin, so workers do
+  not need access to the working directory.
+- Without `--destination-hosts`, the destination is local to each source worker.
+- With `--destination-hosts`, each destination host must expose the same
+  destination storage. The option applies only to rsync.
+- Rclone workers must have the configuration at the same absolute
+  `--rclone-config` path, `python3` on their `PATH`, and writable temporary
+  storage for their chunk list. Encrypted rclone configurations must be
+  unlocked noninteractively, for example through `RCLONE_CONFIG_PASS` on the
+  transfer host. SSH workers need noninteractive access to any destination
+  hosts they use.
+
+Filesystem destinations on SSH hosts must be absolute paths; dsync passes them
+unchanged so the destination host resolves any symlinks or `..` components.
+Source and configuration paths sent to workers retain their symlink spelling
+(relative paths and `~` are expanded on the controller). Destination overlap
+checks apply to local transfers; the controller cannot validate a remote
+host's filesystem layout.
+
+Both SSH hops use batch authentication, preserve stdin without a terminal,
+allow 15 seconds to connect, and send keepalives every 15 seconds with three
+missed replies allowed. Host keys must already be trusted. This detects a dead
+SSH connection; it does not impose a total transfer deadline or resolve a
+stalled NFS mount. Each host must mount the intended shared source/destination
+storage: matching paths or filenames alone do not establish filesystem identity.
+
+Host files currently accept DNS names, IPv4 addresses, SSH aliases, and optional
+usernames; IPv6 literals are not supported. Rsync remote destinations should
+be supplied through `--destination-hosts`, rather than a `host:path` positional
+argument.
+
+## Filename and metadata handling
+
+Paths with spaces, quotes, or shell metacharacters are passed safely as
+arguments. Rsync chunk lists are NUL-delimited, including support for newline
+filenames. Rclone uses raw file lists so leading/trailing spaces and names
+starting with `#` or `;` are preserved. For compatibility with older rclone
+versions, filenames containing newlines or carriage returns cause a clear
+error before cloud transfers start.
+
+Rsync preserves symlinks and empty directories. Rclone uses its standard copy
+semantics: empty directories and symlinks are not uploaded. Parallel rsync
+jobs can update common parent directories, so final directory modification
+times are not guaranteed to match the source. This tool does not provide a
+filesystem snapshot or cross-chunk hard-link preservation.
+
+## Failures and large transfers
+
+A failed run can leave completed chunks at the destination. Fix the connection
+or permissions and rerun, using `--reuse` only while its source listing remains
+valid. Rsync and rclone compare existing destination files on the next run;
+byte-level upload resumption and incomplete-object cleanup depend on the backend.
+Rclone's own retry and network timeout settings remain in effect. A disconnected
+worker may continue running until SSH/the remote tool notices the disconnect.
+
+Basic chunk generation keeps at most 32 chunk files open. Its cloud traversal
+streams filenames and holds pending directory paths, so a directory containing
+many files does not require a complete filename list in Python memory. Fpart
+partitioning and the transfer tools still have their own memory requirements.
+Cloud preflight stores one file list per active process in that host's temporary
+directory; allow scratch space proportional to those lists.
+
+`-n` limits transfer processes, not total resource usage. Each rclone process
+has two file transfers plus its own checkers, buffers, and destination listings.
+Increase concurrency gradually while watching memory, NFS metadata load, cloud
+rate limits, and log/scratch disk space. Rclone's `RCLONE_NO_TRAVERSE=true` can
+reduce repeated destination listings for small chunks against a large remote,
+but can be slower for large unchanged file sets; set it on the transfer hosts
+only after comparing that workload. See [rclone's tuning guidance](https://rclone.org/docs/#no-traverse).
+
+## Development
+
+The script is organized around `Fpart`, `Rsync`, `Rclone`, and `FilesystemOps`.
+`run()` walks through path checks, tool selection, chunk preparation, and
+transfers. The tools share process scheduling and cancellation helpers;
+`Popen` provides the process handles needed for parallel transfers and cleanup.
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The suite covers actual rsync, rclone, and fpart transfers in temporary local
+directories, plus command quoting, exit status, dry runs, chunk reuse,
+concurrency limits, locking, interruption, missing cloud source files, and a
+connection drop against a temporary loopback HTTP endpoint. A low-file-limit
+test verifies chunk generation with more chunks than available file descriptors.
+External-tool integration tests are skipped when the corresponding binaries
+are missing. No cloud credentials or external network destinations are used.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
-
-## Acknowledgments
-
-----
+[MIT](LICENSE).
