@@ -4,7 +4,8 @@
 # Written by daltschu22 -- https://github.com/daltschu22
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from collections import OrderedDict
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import itertools
@@ -127,6 +128,12 @@ def absolute_path(value):
     return Path(value).expanduser().absolute()
 
 
+def ssh_options():
+    # Use the same noninteractive, bounded connection on both SSH hops.
+    return ['-T', '-o', 'StdinNull=no', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
+            '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3']
+
+
 def read_hosts(filename):
     if not filename:
         return []
@@ -172,16 +179,19 @@ def basic_entries(source, cloud):
                     yield b'./' + os.fsencode(entry.name)
         return
 
-    def onerror(error):
-        raise error
-
-    # Streaming traversal avoids holding the entire tree in memory. Do not follow
-    # symlink directories: rclone's default copy semantics also skip symlinks.
-    for root, dirs, files in os.walk(source, onerror=onerror):
-        dirs[:] = [name for name in dirs if not excluded(name)]
-        for name in files:
-            if not excluded(name):
-                yield os.fsencode(os.path.relpath(os.path.join(root, name), source))
+    # Walk without accumulating every filename in a wide directory. Keep one
+    # scandir handle open and only queue directories; rclone skips symlinks.
+    directories = [str(source)]
+    while directories:
+        directory = directories.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if excluded(entry.name) or entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(entry.path)
+                else:
+                    yield os.fsencode(os.path.relpath(entry.path, source))
 
 
 def cloud_entry(entry):
@@ -316,15 +326,24 @@ class FilesystemOps:
 
     def no_fpart_chunk_gen(self, directory, number, cloud):
         chunks = []
-        handles = []
-        with ExitStack() as stack:
+        handles = OrderedDict()
+        try:
             for index, entry in enumerate(basic_entries(self.source, cloud)):
                 slot = index % number
-                if slot == len(handles):
+                if slot == len(chunks):
                     path = directory / 'chunk.{}'.format(slot)
                     chunks.append(path)
-                    handles.append(stack.enter_context(path.open('wb')))
-                handles[slot].write(cloud_entry(entry) if cloud else entry + b'\0')
+                handle = handles.pop(slot, None)
+                if handle is None:
+                    if len(handles) >= 32:
+                        _, oldest = handles.popitem(last=False)
+                        oldest.close()
+                    handle = chunks[slot].open('ab')
+                handles[slot] = handle
+                handle.write(cloud_entry(entry) if cloud else entry + b'\0')
+        finally:
+            for handle in handles.values():
+                handle.close()
         return chunks
 
     def owned_chunks(self):
@@ -419,6 +438,8 @@ class Rsync:
         if args.no_fpart:
             command += ['--recursive', '--exclude=.zfs', '--exclude=.snapshot*']
         if dest_host:
+            # This SSH client runs on the worker when --source-hosts is used.
+            command += ['--rsh', shlex.join(['ssh', *ssh_options()])]
             dest = '{}:{}'.format(dest_host, dest)
         return finish_transfer_command(command, args, source, dest, source_host)
 
@@ -428,6 +449,26 @@ class Rclone:
 
     name = 'rclone'
 
+    # Executed on the host reading the source. Rclone silently ignores missing
+    # --files-from entries, so validate first and give it a rewindable file list.
+    # The temporary file is unlinked automatically; exec keeps only its stdin fd.
+    source_check = '''import os, sys, tempfile
+try:
+    source = os.fsencode(sys.argv[1])
+    with tempfile.TemporaryFile() as files:
+        for line in sys.stdin.buffer:
+            entry = line[:-1] if line.endswith(b'\\n') else line
+            if entry:
+                os.lstat(os.path.join(source, entry))
+            files.write(line)
+        files.seek(0)
+        os.dup2(files.fileno(), 0)
+    os.execvp(sys.argv[2], sys.argv[2:])
+except OSError as error:
+    print('ERROR: rclone source check or launch failed: {}'.format(error), file=sys.stderr)
+    sys.exit(1)
+'''
+
     def __init__(self, binary):
         self.rclone_bin = binary
         self.threads = 2
@@ -436,16 +477,20 @@ class Rclone:
         rclone_bin = Path(self.rclone_bin).name if source_host else self.rclone_bin
         config = absolute_path(args.rclone_config) if source_host else local_path(args.rclone_config)
         command = [rclone_bin, 'copy', '-v', '--transfers', str(self.threads),
-                   '--config', str(config), '--files-from-raw', '-']
-        return finish_transfer_command(command, args, source, dest, source_host)
+                   '--ask-password=false', '--config', str(config), '--files-from-raw', '-']
+        return finish_transfer_command(command, args, source, dest, source_host,
+                                       source_check=self.source_check)
 
 
-def finish_transfer_command(command, args, source, dest, source_host):
+def finish_transfer_command(command, args, source, dest, source_host, source_check=None):
     if args.dry_run:
         command.append('--dry-run')
     command += ['--', os.path.join(str(source), ''), dest]
+    if source_check:
+        python = 'python3' if source_host else sys.executable
+        command = [python, '-c', source_check, str(source), *command]
     if source_host:
-        command = [executable('ssh'), '-o', 'BatchMode=yes', '--', source_host,
+        command = [executable('ssh'), *ssh_options(), '--', source_host,
                    ' '.join(shlex.quote(arg) for arg in command)]
     return command
 

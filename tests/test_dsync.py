@@ -1,14 +1,18 @@
 """Regression tests; integration tests use only temporary local directories."""
 
 import os
+from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -331,12 +335,119 @@ class SyncTests(unittest.TestCase):
         with mock.patch.object(dsync, 'executable', return_value='/usr/bin/ssh'):
             command = dsync.Rsync('/custom/bin/rsync').build_command(
                 args, self.source, str(self.dest), 'user@worker', 'storage')
-        self.assertEqual(command[:5], ['/usr/bin/ssh', '-o', 'BatchMode=yes', '--', 'user@worker'])
-        remote = shlex.split(command[5])
+        separator = command.index('--')
+        self.assertEqual(command[:separator], ['/usr/bin/ssh', *dsync.ssh_options()])
+        self.assertEqual(command[separator + 1], 'user@worker')
+        remote = shlex.split(command[separator + 2])
         self.assertEqual(remote[0], 'rsync')
         self.assertIn('--files-from=-', remote)
         self.assertEqual(remote[-2], str(self.source) + '/')
         self.assertEqual(remote[-1], 'storage:' + str(self.dest))
+        destination_ssh = shlex.split(remote[remote.index('--rsh') + 1])
+        self.assertEqual(destination_ssh, ['ssh', *dsync.ssh_options()])
+
+    @unittest.skipUnless(shutil.which('rclone'), 'rclone required')
+    def test_cloud_reuse_fails_when_a_listed_file_has_disappeared(self):
+        file = self.source / 'file'
+        file.write_text('data')
+        self.cli('--cloud', '--no-fpart', '--dry-run', '--rclone-config', self.config)
+        file.unlink()
+        self.cli('--cloud', '--no-fpart', '--reuse', '--rclone-config', self.config, success=False)
+        self.assertIn('source check', (self.working / 'logs/rclone.err.0').read_text())
+        self.assertFalse(self.dest.exists())
+
+    @unittest.skipUnless(shutil.which('rclone'), 'rclone required')
+    def test_cloud_worker_validates_its_own_source_mount(self):
+        (self.source / 'file').write_text('data')
+        worker_source = self.root / 'empty-worker-mount'
+        worker_source.mkdir()
+        hosts = self.root / 'hosts'
+        hosts.write_text('test-worker\n')
+        self.fake_tool('ssh', '''
+            import os, shlex, subprocess, sys
+            source, worker = os.environ['DSYNC_TEST_SOURCE'], os.environ['DSYNC_TEST_WORKER']
+            command = shlex.split(sys.argv[-1])
+            command = [worker + arg[len(source):] if arg in (source, source + '/') else arg
+                       for arg in command]
+            sys.exit(subprocess.call(command))
+        ''')
+        env = {'PATH': str(self.root / 'bin') + os.pathsep + os.environ['PATH'],
+               'DSYNC_TEST_SOURCE': str(self.source), 'DSYNC_TEST_WORKER': str(worker_source)}
+        with mock.patch.dict(os.environ, env):
+            self.cli('--cloud', '--no-fpart', '--source-hosts', hosts,
+                     '--rclone-config', self.config, success=False)
+        self.assertIn(str(worker_source), (self.working / 'logs/rclone.err.0').read_text())
+        self.assertFalse(self.dest.exists())
+
+    @unittest.skipUnless(shutil.which('rclone'), 'rclone required')
+    def test_cloud_connection_drop_is_reported_as_failure(self):
+        requests = []
+
+        class DisconnectingServer(BaseHTTPRequestHandler):
+            def do_PROPFIND(self):
+                requests.append(self.path)
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), DisconnectingServer) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                self.config.write_text('[testremote]\ntype = webdav\nurl = http://127.0.0.1:{}\n'.format(
+                    server.server_port))
+                (self.source / 'file').write_text('data')
+                self.dest = 'testremote:backup'
+                with mock.patch.dict(os.environ, {'RCLONE_RETRIES': '1', 'RCLONE_LOW_LEVEL_RETRIES': '1',
+                                                  'RCLONE_TIMEOUT': '1s', 'RCLONE_CONTIMEOUT': '1s'}):
+                    result = self.cli('--cloud', '--no-fpart', '--rclone-config', self.config, success=False)
+                self.assertTrue(requests, 'rclone did not reach the test endpoint')
+                self.assertIn('transfer(s) failed', result.stderr)
+                self.assertIn('EOF', (self.working / 'logs/rclone.err.0').read_text())
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+
+    def test_many_chunks_respect_a_small_descriptor_limit(self):
+        for index in range(260):
+            (self.source / str(index)).touch()
+        directory = self.root / 'chunks'
+        directory.mkdir()
+        script = '''
+import resource, sys
+from pathlib import Path
+from dsync import FilesystemOps
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+source, chunks = map(Path, sys.argv[1:])
+FilesystemOps(source, chunks, chunks).no_fpart_chunk_gen(chunks, 128, False)
+'''
+        result = subprocess.run([sys.executable, '-c', script, str(self.source), str(directory)],
+                                cwd=SCRIPT.parent, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = [entry for chunk in directory.iterdir() for entry in dsync.nul_entries(chunk)]
+        self.assertEqual(sorted(actual), sorted(b'./' + str(index).encode() for index in range(260)))
+        self.assertEqual(len(list(directory.iterdir())), 128)
+
+    def test_cloud_listing_yields_before_reading_a_whole_directory(self):
+        entry = mock.Mock(name='file-entry')
+        entry.name = 'first'
+        entry.path = str(self.source / 'first')
+        entry.is_symlink.return_value = False
+        entry.is_dir.return_value = False
+
+        def entries():
+            yield entry
+            raise AssertionError('directory listing was consumed eagerly')
+
+        with mock.patch.object(dsync.os, 'scandir', return_value=nullcontext(entries())):
+            files = dsync.basic_entries(self.source, True)
+            try:
+                self.assertEqual(next(files), b'first')
+            finally:
+                files.close()
 
     @unittest.skipUnless(shutil.which('rsync') and shutil.which('rclone'), 'transfer tools required')
     def test_source_host_execution_with_local_ssh_shim(self):

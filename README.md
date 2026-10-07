@@ -100,10 +100,13 @@ mode, and chunk checksums. Repeat `--cloud` and/or `--no-fpart` if used during
 generation. `-n` still caps concurrent processes, even if more chunks exist.
 Legacy chunks without a manifest must be regenerated once.
 
-Reuse does **not** detect changes within the source tree. Regenerate chunks
-when files are added or removed; in particular, rclone may silently skip
-listed files that no longer exist. Do not modify a source tree during a copy
-if a consistent snapshot is required.
+Reuse does **not** discover new files within the source tree. Regenerate chunks
+when files are added or removed. Before each cloud chunk is copied, a Python
+check on the transfer host verifies that all listed source entries exist and
+spools the list to a temporary file. Missing entries fail that chunk instead
+of being silently skipped by rclone. This adds a metadata lookup per entry
+and temporary disk space for the list, and cannot prevent changes after the
+check. Use a stable source snapshot when consistency is required.
 
 ## Multiple hosts
 
@@ -122,8 +125,11 @@ python3 dsync.py /mnt/source /mnt/destination -n 8 \
 - With `--destination-hosts`, each destination host must expose the same
   destination storage. The option applies only to rsync.
 - Rclone workers must have the configuration at the same absolute
-  `--rclone-config` path. SSH workers need noninteractive access to any
-  destination hosts they use.
+  `--rclone-config` path, `python3` on their `PATH`, and writable temporary
+  storage for their chunk list. Encrypted rclone configurations must be
+  unlocked noninteractively, for example through `RCLONE_CONFIG_PASS` on the
+  transfer host. SSH workers need noninteractive access to any destination
+  hosts they use.
 
 Filesystem destinations on SSH hosts must be absolute paths; dsync passes them
 unchanged so the destination host resolves any symlinks or `..` components.
@@ -131,6 +137,13 @@ Source and configuration paths sent to workers retain their symlink spelling
 (relative paths and `~` are expanded on the controller). Destination overlap
 checks apply to local transfers; the controller cannot validate a remote
 host's filesystem layout.
+
+Both SSH hops use batch authentication, preserve stdin without a terminal,
+allow 15 seconds to connect, and send keepalives every 15 seconds with three
+missed replies allowed. Host keys must already be trusted. This detects a dead
+SSH connection; it does not impose a total transfer deadline or resolve a
+stalled NFS mount. Each host must mount the intended shared source/destination
+storage: matching paths or filenames alone do not establish filesystem identity.
 
 Host files currently accept DNS names, IPv4 addresses, SSH aliases, and optional
 usernames; IPv6 literals are not supported. Rsync remote destinations should
@@ -152,6 +165,30 @@ jobs can update common parent directories, so final directory modification
 times are not guaranteed to match the source. This tool does not provide a
 filesystem snapshot or cross-chunk hard-link preservation.
 
+## Failures and large transfers
+
+A failed run can leave completed chunks at the destination. Fix the connection
+or permissions and rerun, using `--reuse` only while its source listing remains
+valid. Rsync and rclone compare existing destination files on the next run;
+byte-level upload resumption and incomplete-object cleanup depend on the backend.
+Rclone's own retry and network timeout settings remain in effect. A disconnected
+worker may continue running until SSH/the remote tool notices the disconnect.
+
+Basic chunk generation keeps at most 32 chunk files open. Its cloud traversal
+streams filenames and holds pending directory paths, so a directory containing
+many files does not require a complete filename list in Python memory. Fpart
+partitioning and the transfer tools still have their own memory requirements.
+Cloud preflight stores one file list per active process in that host's temporary
+directory; allow scratch space proportional to those lists.
+
+`-n` limits transfer processes, not total resource usage. Each rclone process
+has two file transfers plus its own checkers, buffers, and destination listings.
+Increase concurrency gradually while watching memory, NFS metadata load, cloud
+rate limits, and log/scratch disk space. Rclone's `RCLONE_NO_TRAVERSE=true` can
+reduce repeated destination listings for small chunks against a large remote,
+but can be slower for large unchanged file sets; set it on the transfer hosts
+only after comparing that workload. See [rclone's tuning guidance](https://rclone.org/docs/#no-traverse).
+
 ## Development
 
 The script is organized around `Fpart`, `Rsync`, `Rclone`, and `FilesystemOps`.
@@ -165,9 +202,11 @@ python3 -m unittest discover -s tests -v
 
 The suite covers actual rsync, rclone, and fpart transfers in temporary local
 directories, plus command quoting, exit status, dry runs, chunk reuse,
-concurrency limits, locking, and interruption. External-tool integration tests
-are skipped when the corresponding binaries are missing. No cloud credentials
-or network destinations are used by the tests.
+concurrency limits, locking, interruption, missing cloud source files, and a
+connection drop against a temporary loopback HTTP endpoint. A low-file-limit
+test verifies chunk generation with more chunks than available file descriptors.
+External-tool integration tests are skipped when the corresponding binaries
+are missing. No cloud credentials or external network destinations are used.
 
 ## License
 
