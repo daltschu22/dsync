@@ -66,7 +66,11 @@ python3 dsync.py /mnt/source remote:bucket/path -n 4 --cloud --dry-run
 
 The command waits for all transfers. Any partitioning or transfer failure
 returns a nonzero exit status and identifies the relevant error log. Ctrl+C
-stops active local transfer process groups before exiting.
+and SIGTERM stop active local partition/transfer process groups before exiting
+with status 130 and 143 respectively. Cleanup waits up to five seconds before
+killing surviving group members, even if their parent has exited. Further
+interruptions during cleanup do not abandon the remaining processes. Remote
+worker cleanup depends on SSH and the remote tool's disconnect behavior.
 
 ## Working files, logs, and reuse
 
@@ -79,7 +83,11 @@ The working directory reserves `chunks/`, `manifest.json`, and `.dsync.lock`.
 Only one run can use it at a time. Use separate working **and log** directories
 for independent simultaneous runs. Logs are overwritten on subsequent runs.
 Chunk generation is staged so a partitioning failure preserves the previous
-completed chunk set.
+completed chunk set. Regeneration replaces only unchanged chunk files recorded
+in a valid manifest. Unrecognized files, modified chunks, and symlinked chunk
+directories cause an error and are preserved, including during dry runs. Use
+a new working directory or move those files aside after reviewing them. An
+interrupted replacement may also require a new working directory.
 
 Reuse a successful partition without rescanning the source:
 
@@ -116,6 +124,13 @@ python3 dsync.py /mnt/source /mnt/destination -n 8 \
 - Rclone workers must have the configuration at the same absolute
   `--rclone-config` path. SSH workers need noninteractive access to any
   destination hosts they use.
+
+Filesystem destinations on SSH hosts must be absolute paths; dsync passes them
+unchanged so the destination host resolves any symlinks or `..` components.
+Source and configuration paths sent to workers retain their symlink spelling
+(relative paths and `~` are expanded on the controller). Destination overlap
+checks apply to local transfers; the controller cannot validate a remote
+host's filesystem layout.
 
 Host files currently accept DNS names, IPv4 addresses, SSH aliases, and optional
 usernames; IPv6 literals are not supported. Rsync remote destinations should

@@ -23,6 +23,65 @@ class SyncError(Exception):
     """An actionable transfer or configuration error."""
 
 
+class SyncInterrupted(KeyboardInterrupt):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+class Cancellation:
+    """Defer interruption while a newly spawned process is being registered."""
+
+    def __init__(self):
+        self.signum = None
+        self.deferred = 0
+        self.cleaning_up = False
+
+    def __call__(self, signum, frame):
+        if not self.cleaning_up:
+            self.signum = self.signum or signum
+            if not self.deferred:
+                self.raise_if_pending()
+
+    def raise_if_pending(self):
+        if self.signum is not None and not self.cleaning_up:
+            self.cleaning_up = True
+            raise SyncInterrupted(self.signum)
+
+
+@contextmanager
+def cancellation_handlers():
+    handler = Cancellation()
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in previous:
+            signal.signal(sig, handler)
+        yield
+    finally:
+        for sig, old_handler in previous.items():
+            signal.signal(sig, old_handler)
+
+
+@contextmanager
+def defer_cancellation():
+    handler = signal.getsignal(signal.SIGTERM)
+    if isinstance(handler, Cancellation):
+        handler.deferred += 1
+    try:
+        yield
+    finally:
+        if isinstance(handler, Cancellation):
+            handler.deferred -= 1
+            if not handler.deferred:
+                handler.raise_if_pending()
+
+
+def start_process(command, processes, **kwargs):
+    with defer_cancellation():
+        process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        processes.append(process)
+        return process
+
+
 def positive_int(value):
     number = int(value)
     if number < 1:
@@ -59,6 +118,11 @@ def executable(name):
 
 def local_path(value):
     return Path(value).expanduser().resolve()
+
+
+def absolute_path(value):
+    """Expand a controller-relative path without dereferencing its symlinks."""
+    return Path(value).expanduser().absolute()
 
 
 def read_hosts(filename):
@@ -152,23 +216,37 @@ def nul_entries(path):
         raise SyncError('Incomplete NUL-delimited chunk: {}'.format(path))
 
 
-def stop_processes(processes):
-    for process in processes:
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    deadline = time.monotonic() + 5
-    for process in processes:
-        try:
-            process.wait(timeout=max(0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+def signal_group(process, signum):
+    # Reap the leader if possible, but its exit says nothing about descendants.
+    process.poll()
+    try:
+        os.killpg(process.pid, signum)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def stop_processes(processes, grace_seconds=5):
+    with defer_cancellation():
+        groups = [process for process in processes if signal_group(process, signal.SIGTERM)]
+        deadline = time.monotonic() + grace_seconds
+        while groups and time.monotonic() < deadline:
+            groups = [process for process in groups if signal_group(process, 0)]
+            if groups:
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        for process in groups:
+            signal_group(process, signal.SIGKILL)
+        for process in processes:
             process.wait()
+
+
+def run_partition(command, source, out, err):
+    processes = []
+    try:
+        process = start_process(command, processes, cwd=source, stdout=out, stderr=err)
+        return process.wait()
+    finally:
+        stop_processes(processes)
 
 
 def partition_with_fpart(directory, source, number, cloud, logs):
@@ -178,11 +256,7 @@ def partition_with_fpart(directory, source, number, cloud, logs):
         command.append('-z')  # Preserve empty directories without recursively copying chunks twice.
     command.append('.')
     with (logs / 'fpart.out').open('wb') as out, (logs / 'fpart.err').open('wb') as err:
-        process = subprocess.Popen(command, cwd=source, stdout=out, stderr=err, start_new_session=True)
-        try:
-            status = process.wait()
-        finally:
-            stop_processes([process])
+        status = run_partition(command, source, out, err)
     if status:
         raise SyncError('fpart failed (exit {}); see {}'.format(status, logs / 'fpart.err'))
     # Fpart can return zero after filesystem traversal errors. Without verbose
@@ -220,26 +294,70 @@ def chunk_identity(source, args):
             'cloud': args.cloud, 'no_fpart': args.no_fpart}
 
 
+def read_manifest(path):
+    if path.is_symlink():
+        raise ValueError('manifest must not be a symlink')
+    manifest = json.loads(path.read_text())
+    identity = manifest['identity']
+    if identity['version'] != 1 or not isinstance(identity['source'], str):
+        raise ValueError('unrecognized manifest identity')
+    for key in ('device', 'inode'):
+        if type(identity[key]) is not int:
+            raise ValueError('invalid source identity')
+    for key in ('cloud', 'no_fpart'):
+        if type(identity[key]) is not bool:
+            raise ValueError('invalid chunking mode')
+    for name, checksum in manifest['chunks'].items():
+        if not re.fullmatch(r'chunk\.\d+', name) or not re.fullmatch(r'[0-9a-f]{64}', checksum):
+            raise ValueError('invalid chunk record')
+    return manifest
+
+
+def owned_chunks(working):
+    """Return only verified files that a previous dsync run created."""
+    target = working / 'chunks'
+    manifest_path = working / 'manifest.json'
+    try:
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise ValueError('chunks must be a directory, not a file or symlink')
+        entries = set(target.iterdir()) if target.exists() else set()
+        if manifest_path.exists() or manifest_path.is_symlink():
+            manifest = read_manifest(manifest_path)
+            chunks = [target / name for name in manifest['chunks']]
+            if entries != set(chunks):
+                raise ValueError('chunk directory contains unrecognized or missing files')
+            for path in chunks:
+                if path.is_symlink() or not path.is_file() or digest(path) != manifest['chunks'][path.name]:
+                    raise ValueError('chunk is not an unchanged dsync file: {}'.format(path.name))
+            return chunks
+        if entries:
+            raise ValueError('existing chunks have no ownership manifest')
+        return []
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise SyncError('Refusing to replace working files: {}. Use a new working directory or move '
+                        'the existing files aside after reviewing them.'.format(error)) from error
+
+
 def prepare_chunks(args, source, working, logs):
     manifest_path = working / 'manifest.json'
     identity = chunk_identity(source, args)
     if args.reuse:
         try:
-            manifest = json.loads(manifest_path.read_text())
+            manifest = read_manifest(manifest_path)
             if manifest['identity'] != identity:
                 raise ValueError('source or chunking mode differs')
             chunks = []
             for name, checksum in manifest['chunks'].items():
-                if not re.fullmatch(r'chunk\.\d+', name):
-                    raise ValueError('invalid chunk name')
                 path = working / 'chunks' / name
-                if digest(path) != checksum:
+                if (working / 'chunks').is_symlink() or path.is_symlink() or digest(path) != checksum:
                     raise ValueError('chunk changed: {}'.format(name))
                 chunks.append(path)
             return chunks
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-            raise SyncError('Cannot reuse chunks: {}. Run without --reuse to regenerate.'.format(error)) from error
+            raise SyncError('Cannot reuse chunks: {}. Regenerate without --reuse; if working files '
+                            'were modified, use a new working directory.'.format(error)) from error
 
+    owned_chunks(working)  # Refuse unrelated data before doing any partition work.
     # Build in isolation; a failed partition must not replace the previous good set.
     with tempfile.TemporaryDirectory(prefix='.partition-', dir=working) as temp:
         directory = Path(temp)
@@ -251,13 +369,15 @@ def prepare_chunks(args, source, working, logs):
         new_manifest = directory / 'manifest.json'
         new_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
         target = working / 'chunks'
+        previous_chunks = owned_chunks(working)  # Recheck after the source scan.
         # Invalidate before replacing so interruption cannot leave reusable stale state.
         manifest_path.unlink(missing_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        target.mkdir()
+        for path in previous_chunks:
+            path.unlink()
+        target.mkdir(exist_ok=True)
         for path in chunks:
-            path.replace(target / path.name)
+            # Exclusive creation refuses any file that appeared since validation.
+            os.link(path, target / path.name)
         new_manifest.replace(manifest_path)
         return [target / path.name for path in chunks]
 
@@ -265,7 +385,8 @@ def prepare_chunks(args, source, working, logs):
 def transfer_command(args, binary, source, dest, source_host, dest_host):
     command = [Path(binary).name if source_host else binary]
     if args.cloud:
-        command += ['copy', '-v', '--transfers', '2', '--config', str(local_path(args.rclone_config)),
+        config = absolute_path(args.rclone_config) if source_host else local_path(args.rclone_config)
+        command += ['copy', '-v', '--transfers', '2', '--config', str(config),
                     '--files-from-raw', '-']
     else:
         command += ['-av', '--protect-args', '--from0', '--files-from=-']
@@ -287,6 +408,7 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
     dest_cycle = itertools.cycle(dest_hosts or [None])
     jobs = iter(enumerate(chunks))
     active = []
+    processes = []
     failures = []
     exhausted = False
     tool = 'rclone' if args.cloud else 'rsync'
@@ -302,8 +424,7 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
                                            next(source_cycle), next(dest_cycle))
                 error_path = logs / '{}.err.{}'.format(tool, index)
                 with chunk.open('rb') as files, (logs / '{}.out.{}'.format(tool, index)).open('wb') as out, error_path.open('wb') as err:
-                    process = subprocess.Popen(command, stdin=files, stdout=out, stderr=err,
-                                               start_new_session=True)
+                    process = start_process(command, processes, stdin=files, stdout=out, stderr=err)
                 active.append((process, error_path))
             pending = []
             for process, error_path in active:
@@ -312,11 +433,14 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
                     pending.append((process, error_path))
                 elif status:
                     failures.append('exit {}: {}'.format(status, error_path))
+            # Retain groups with surviving descendants even after their leader exits.
+            processes = [process for process in processes
+                         if process.poll() is None or signal_group(process, 0)]
             active = pending
             if active:
                 time.sleep(0.05)
     finally:
-        stop_processes([process for process, _ in active])
+        stop_processes(processes)
     if failures:
         raise SyncError('{} transfer(s) failed; {}'.format(len(failures), '; '.join(failures)))
 
@@ -335,15 +459,19 @@ def run(args):
         raise SyncError('--destination-hosts applies only to rsync, not --cloud')
     if any(inside(path, source) or inside(source, path) for path in (working, logs)):
         raise SyncError('Working/log directories and the source tree must not overlap')
-    if args.cloud:
-        # Preserve remote syntax, including a bucket root; normalize local backends.
-        dest = args.dest if ':' in args.dest and not os.path.isabs(args.dest) else str(local_path(args.dest))
+    cloud_remote = args.cloud and ':' in args.dest and not os.path.isabs(args.dest)
+    remote_filesystem = bool(source_hosts or dest_hosts) and not cloud_remote
+    if cloud_remote:
+        dest = args.dest
+    elif remote_filesystem:
+        if not os.path.isabs(args.dest):
+            raise SyncError('Remote filesystem destinations must use an absolute path')
+        dest = args.dest  # Only the destination host can resolve its symlinks.
     else:
         if not os.path.isabs(os.path.expanduser(args.dest)) and ':' in args.dest:
             raise SyncError('Use --destination-hosts for remote rsync destinations')
         dest = str(local_path(args.dest))
-    # An absolute rclone destination denotes a local backend too.
-    if not dest_hosts and (not args.cloud or os.path.isabs(dest)):
+    if not cloud_remote and not remote_filesystem:
         destination = local_path(dest)
         if inside(destination, source) or inside(source, destination):
             raise SyncError('Source and destination directories must not overlap')
@@ -365,14 +493,20 @@ def run(args):
             return
         if not args.cloud and not dest_hosts and not source_hosts and not args.dry_run:
             Path(dest).mkdir(parents=True, exist_ok=True)
-        run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, logs)
+        transfer_source = absolute_path(args.source) if source_hosts else source
+        run_transfers(args, chunks, binary, transfer_source, dest, source_hosts, dest_hosts, logs)
         print('-- {} completed successfully; logs: {}'.format('Dry run' if args.dry_run else 'Transfer', logs))
 
 
 def main(argv=None):
     args = parse_arguments(argv)
     try:
-        run(args)
+        with cancellation_handlers():
+            run(args)
+    except SyncInterrupted as error:
+        print('ERROR: Interrupted by {}; active local process groups stopped'.format(
+            signal.Signals(error.signum).name), file=sys.stderr)
+        return 128 + error.signum
     except KeyboardInterrupt:
         print('ERROR: Interrupted; active local transfer processes stopped', file=sys.stderr)
         return 130
