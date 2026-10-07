@@ -262,7 +262,7 @@ class SyncTests(unittest.TestCase):
         with mock.patch.object(dsync, 'run_transfers') as transfer:
             dsync.run(args)
         self.assertEqual(transfer.call_args.args[3], source_alias)
-        command = dsync.transfer_command(args, 'rclone', source_alias, 'remote:bucket', 'test-host', None)
+        command = dsync.Rclone('rclone').build_command(args, source_alias, 'remote:bucket', 'test-host', None)
         remote = shlex.split(command[-1])
         self.assertEqual(remote[remote.index('--config') + 1], str(config_alias))
 
@@ -278,7 +278,8 @@ class SyncTests(unittest.TestCase):
         (self.source / '.hidden').write_text('data')
         directory = self.root / 'parts'
         directory.mkdir()
-        chunks = dsync.basic_chunks(directory, self.source, 100, False)
+        file_ops = dsync.FilesystemOps(self.source, self.working, self.working / 'logs')
+        chunks = file_ops.no_fpart_chunk_gen(directory, 100, False)
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].read_bytes(), b'./.hidden\0')
 
@@ -316,19 +317,20 @@ class SyncTests(unittest.TestCase):
         logs = self.working / 'logs'
         logs.mkdir()
         (self.source / 'valid').write_text('data')
-        previous = dsync.prepare_chunks(args, self.source, self.working, logs)
+        file_ops = dsync.FilesystemOps(self.source, self.working, logs)
+        previous = file_ops.prepare_chunks(args)
         manifest = (self.working / 'manifest.json').read_bytes()
         (self.source / 'bad\nname').write_text('data')
         with self.assertRaises(dsync.SyncError):
-            dsync.prepare_chunks(args, self.source, self.working, logs)
+            file_ops.prepare_chunks(args)
         self.assertEqual((self.working / 'manifest.json').read_bytes(), manifest)
         self.assertTrue(previous[0].exists())
 
     def test_ssh_command_quotes_and_streams_chunk_on_stdin(self):
         args = dsync.parse_arguments([str(self.source), str(self.dest), '-n', '2', '--no-fpart'])
         with mock.patch.object(dsync, 'executable', return_value='/usr/bin/ssh'):
-            command = dsync.transfer_command(args, '/custom/bin/rsync', self.source,
-                                             str(self.dest), 'user@worker', 'storage')
+            command = dsync.Rsync('/custom/bin/rsync').build_command(
+                args, self.source, str(self.dest), 'user@worker', 'storage')
         self.assertEqual(command[:5], ['/usr/bin/ssh', '-o', 'BatchMode=yes', '--', 'user@worker'])
         remote = shlex.split(command[5])
         self.assertEqual(remote[0], 'rsync')
@@ -418,7 +420,7 @@ class SyncTests(unittest.TestCase):
         logs.mkdir()
         args = dsync.parse_arguments([str(self.source), str(self.dest), '-n', '2', '--no-fpart'])
         with mock.patch.dict(os.environ, {'DSYNC_TEST_EVENTS': str(events)}):
-            dsync.run_transfers(args, chunks, str(tool), self.source, str(self.dest), [], [], logs)
+            dsync.run_transfers(args, chunks, dsync.Rsync(str(tool)), self.source, str(self.dest), [], [], logs)
         active = peak = started = 0
         for line in events.read_text().splitlines():
             if line.startswith('start'):

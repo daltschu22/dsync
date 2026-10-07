@@ -154,6 +154,11 @@ filesystem snapshot or cross-chunk hard-link preservation.
 
 ## Development
 
+The script is organized around `Fpart`, `Rsync`, `Rclone`, and `FilesystemOps`.
+`run()` walks through path checks, tool selection, chunk preparation, and
+transfers. The tools share process scheduling and cancellation helpers;
+`Popen` provides the process handles needed for parallel transfers and cleanup.
+
 ```sh
 python3 -m unittest discover -s tests -v
 ```

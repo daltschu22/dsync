@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Partition a local filesystem and copy it with bounded parallel transfers."""
 
+# Written by daltschu22 -- https://github.com/daltschu22
+
 import argparse
 from contextlib import ExitStack, contextmanager
 import fcntl
@@ -188,20 +190,6 @@ def cloud_entry(entry):
     return entry + b'\n'
 
 
-def basic_chunks(directory, source, number, cloud):
-    chunks = []
-    handles = []
-    with ExitStack() as stack:
-        for index, entry in enumerate(basic_entries(source, cloud)):
-            slot = index % number
-            if slot == len(handles):
-                path = directory / 'chunk.{}'.format(slot)
-                chunks.append(path)
-                handles.append(stack.enter_context(path.open('wb')))
-            handles[slot].write(cloud_entry(entry) if cloud else entry + b'\0')
-    return chunks
-
-
 def nul_entries(path):
     pending = b''
     with path.open('rb') as handle:
@@ -240,44 +228,49 @@ def stop_processes(processes, grace_seconds=5):
             process.wait()
 
 
-def run_partition(command, source, out, err):
-    processes = []
-    try:
-        process = start_process(command, processes, cwd=source, stdout=out, stderr=err)
-        return process.wait()
-    finally:
-        stop_processes(processes)
+class Fpart:
+    """Run fpart and prepare its file lists for the selected transfer tool."""
 
+    def __init__(self):
+        self.fpart_bin = executable('fpart')
 
-def partition_with_fpart(directory, source, number, cloud, logs):
-    command = [executable('fpart'), '-0', '-x', '.zfs', '-x', '.snapshot*',
-               '-n', str(number), '-o', str(directory / 'chunk')]
-    if not cloud:
-        command.append('-z')  # Preserve empty directories without recursively copying chunks twice.
-    command.append('.')
-    with (logs / 'fpart.out').open('wb') as out, (logs / 'fpart.err').open('wb') as err:
-        status = run_partition(command, source, out, err)
-    if status:
-        raise SyncError('fpart failed (exit {}); see {}'.format(status, logs / 'fpart.err'))
-    # Fpart can return zero after filesystem traversal errors. Without verbose
-    # flags its only normal stderr output is partition statistics. Fail closed
-    # on other diagnostics instead of reporting an incomplete copy as success.
-    with (logs / 'fpart.err').open('rb') as errors:
-        for line in errors:
-            if line.strip() and not re.fullmatch(rb'Part #\d+: size = \d+, files = \d+', line.strip()):
-                raise SyncError('fpart reported a diagnostic; see {}'.format(logs / 'fpart.err'))
-    chunks = sorted(path for path in directory.iterdir()
-                    if re.fullmatch(r'chunk\.\d+', path.name) and path.stat().st_size)
-    if cloud:
-        for path in chunks:
-            converted = path.with_suffix(path.suffix + '.tmp')
-            with converted.open('wb') as out:
-                for entry in nul_entries(path):
-                    if entry.startswith(b'./'):
-                        entry = entry[2:]
-                    out.write(cloud_entry(entry))
-            converted.replace(path)
-    return chunks
+    def run_fpart(self, command, source, out, err):
+        processes = []
+        try:
+            process = start_process(command, processes, cwd=source, stdout=out, stderr=err)
+            return process.wait()
+        finally:
+            stop_processes(processes)
+
+    def generate_chunks(self, directory, source, number, cloud, logs):
+        command = [self.fpart_bin, '-0', '-x', '.zfs', '-x', '.snapshot*',
+                   '-n', str(number), '-o', str(directory / 'chunk')]
+        if not cloud:
+            command.append('-z')  # Preserve empty directories without recursively copying chunks twice.
+        command.append('.')
+        with (logs / 'fpart.out').open('wb') as out, (logs / 'fpart.err').open('wb') as err:
+            status = self.run_fpart(command, source, out, err)
+        if status:
+            raise SyncError('fpart failed (exit {}); see {}'.format(status, logs / 'fpart.err'))
+        # Fpart can return zero after filesystem traversal errors. Without verbose
+        # flags its only normal stderr output is partition statistics. Fail closed
+        # on other diagnostics instead of reporting an incomplete copy as success.
+        with (logs / 'fpart.err').open('rb') as errors:
+            for line in errors:
+                if line.strip() and not re.fullmatch(rb'Part #\d+: size = \d+, files = \d+', line.strip()):
+                    raise SyncError('fpart reported a diagnostic; see {}'.format(logs / 'fpart.err'))
+        chunks = sorted(path for path in directory.iterdir()
+                        if re.fullmatch(r'chunk\.\d+', path.name) and path.stat().st_size)
+        if cloud:
+            for path in chunks:
+                converted = path.with_suffix(path.suffix + '.tmp')
+                with converted.open('wb') as out:
+                    for entry in nul_entries(path):
+                        if entry.startswith(b'./'):
+                            entry = entry[2:]
+                        out.write(cloud_entry(entry))
+                converted.replace(path)
+        return chunks
 
 
 def digest(path):
@@ -313,35 +306,56 @@ def read_manifest(path):
     return manifest
 
 
-def owned_chunks(working):
-    """Return only verified files that a previous dsync run created."""
-    target = working / 'chunks'
-    manifest_path = working / 'manifest.json'
-    try:
-        if target.is_symlink() or (target.exists() and not target.is_dir()):
-            raise ValueError('chunks must be a directory, not a file or symlink')
-        entries = set(target.iterdir()) if target.exists() else set()
-        if manifest_path.exists() or manifest_path.is_symlink():
-            manifest = read_manifest(manifest_path)
-            chunks = [target / name for name in manifest['chunks']]
-            if entries != set(chunks):
-                raise ValueError('chunk directory contains unrecognized or missing files')
-            for path in chunks:
-                if path.is_symlink() or not path.is_file() or digest(path) != manifest['chunks'][path.name]:
-                    raise ValueError('chunk is not an unchanged dsync file: {}'.format(path.name))
-            return chunks
-        if entries:
-            raise ValueError('existing chunks have no ownership manifest')
-        return []
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise SyncError('Refusing to replace working files: {}. Use a new working directory or move '
-                        'the existing files aside after reviewing them.'.format(error)) from error
+class FilesystemOps:
+    """Manage basic chunking, saved chunks, and their ownership checks."""
 
+    def __init__(self, source, working_dir, log_dir):
+        self.source = source
+        self.working_dir = working_dir
+        self.log_dir = log_dir
 
-def prepare_chunks(args, source, working, logs):
-    manifest_path = working / 'manifest.json'
-    identity = chunk_identity(source, args)
-    if args.reuse:
+    def no_fpart_chunk_gen(self, directory, number, cloud):
+        chunks = []
+        handles = []
+        with ExitStack() as stack:
+            for index, entry in enumerate(basic_entries(self.source, cloud)):
+                slot = index % number
+                if slot == len(handles):
+                    path = directory / 'chunk.{}'.format(slot)
+                    chunks.append(path)
+                    handles.append(stack.enter_context(path.open('wb')))
+                handles[slot].write(cloud_entry(entry) if cloud else entry + b'\0')
+        return chunks
+
+    def owned_chunks(self):
+        """Return only verified files that a previous dsync run created."""
+        working = self.working_dir
+        target = working / 'chunks'
+        manifest_path = working / 'manifest.json'
+        try:
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise ValueError('chunks must be a directory, not a file or symlink')
+            entries = set(target.iterdir()) if target.exists() else set()
+            if manifest_path.exists() or manifest_path.is_symlink():
+                manifest = read_manifest(manifest_path)
+                chunks = [target / name for name in manifest['chunks']]
+                if entries != set(chunks):
+                    raise ValueError('chunk directory contains unrecognized or missing files')
+                for path in chunks:
+                    if path.is_symlink() or not path.is_file() or digest(path) != manifest['chunks'][path.name]:
+                        raise ValueError('chunk is not an unchanged dsync file: {}'.format(path.name))
+                return chunks
+            if entries:
+                raise ValueError('existing chunks have no ownership manifest')
+            return []
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise SyncError('Refusing to replace working files: {}. Use a new working directory or move '
+                            'the existing files aside after reviewing them.'.format(error)) from error
+
+    def check_existing_chunks(self, args):
+        working = self.working_dir
+        manifest_path = working / 'manifest.json'
+        identity = chunk_identity(self.source, args)
         try:
             manifest = read_manifest(manifest_path)
             if manifest['identity'] != identity:
@@ -357,43 +371,76 @@ def prepare_chunks(args, source, working, logs):
             raise SyncError('Cannot reuse chunks: {}. Regenerate without --reuse; if working files '
                             'were modified, use a new working directory.'.format(error)) from error
 
-    owned_chunks(working)  # Refuse unrelated data before doing any partition work.
-    # Build in isolation; a failed partition must not replace the previous good set.
-    with tempfile.TemporaryDirectory(prefix='.partition-', dir=working) as temp:
-        directory = Path(temp)
-        if args.no_fpart:
-            chunks = basic_chunks(directory, source, args.number, args.cloud)
-        else:
-            chunks = partition_with_fpart(directory, source, args.number, args.cloud, logs)
-        manifest = {'identity': identity, 'chunks': {p.name: digest(p) for p in chunks}}
-        new_manifest = directory / 'manifest.json'
-        new_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
-        target = working / 'chunks'
-        previous_chunks = owned_chunks(working)  # Recheck after the source scan.
-        # Invalidate before replacing so interruption cannot leave reusable stale state.
-        manifest_path.unlink(missing_ok=True)
-        for path in previous_chunks:
-            path.unlink()
-        target.mkdir(exist_ok=True)
-        for path in chunks:
-            # Exclusive creation refuses any file that appeared since validation.
-            os.link(path, target / path.name)
-        new_manifest.replace(manifest_path)
-        return [target / path.name for path in chunks]
+    def prepare_chunks(self, args):
+        source = self.source
+        working = self.working_dir
+        logs = self.log_dir
+        manifest_path = working / 'manifest.json'
+        identity = chunk_identity(source, args)
+        if args.reuse:
+            return self.check_existing_chunks(args)
+
+        self.owned_chunks()  # Refuse unrelated data before doing any partition work.
+        # Build in isolation; a failed partition must not replace the previous good set.
+        with tempfile.TemporaryDirectory(prefix='.partition-', dir=working) as temp:
+            directory = Path(temp)
+            if args.no_fpart:
+                chunks = self.no_fpart_chunk_gen(directory, args.number, args.cloud)
+            else:
+                chunks = Fpart().generate_chunks(directory, source, args.number, args.cloud, logs)
+            manifest = {'identity': identity, 'chunks': {p.name: digest(p) for p in chunks}}
+            new_manifest = directory / 'manifest.json'
+            new_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
+            target = working / 'chunks'
+            previous_chunks = self.owned_chunks()  # Recheck after the source scan.
+            # Invalidate before replacing so interruption cannot leave reusable stale state.
+            manifest_path.unlink(missing_ok=True)
+            for path in previous_chunks:
+                path.unlink()
+            target.mkdir(exist_ok=True)
+            for path in chunks:
+                # Exclusive creation refuses any file that appeared since validation.
+                os.link(path, target / path.name)
+            new_manifest.replace(manifest_path)
+            return [target / path.name for path in chunks]
 
 
-def transfer_command(args, binary, source, dest, source_host, dest_host):
-    command = [Path(binary).name if source_host else binary]
-    if args.cloud:
-        config = absolute_path(args.rclone_config) if source_host else local_path(args.rclone_config)
-        command += ['copy', '-v', '--transfers', '2', '--config', str(config),
-                    '--files-from-raw', '-']
-    else:
-        command += ['-av', '--protect-args', '--from0', '--files-from=-']
+class Rsync:
+    """Build archive transfers from rsync's NUL-delimited chunk lists."""
+
+    name = 'rsync'
+
+    def __init__(self, binary):
+        self.rsync_bin = binary
+
+    def build_command(self, args, source, dest, source_host, dest_host):
+        rsync_bin = Path(self.rsync_bin).name if source_host else self.rsync_bin
+        command = [rsync_bin, '-av', '--protect-args', '--from0', '--files-from=-']
         if args.no_fpart:
             command += ['--recursive', '--exclude=.zfs', '--exclude=.snapshot*']
         if dest_host:
             dest = '{}:{}'.format(dest_host, dest)
+        return finish_transfer_command(command, args, source, dest, source_host)
+
+
+class Rclone:
+    """Build rclone copy transfers with the requested configuration."""
+
+    name = 'rclone'
+
+    def __init__(self, binary):
+        self.rclone_bin = binary
+        self.threads = 2
+
+    def build_command(self, args, source, dest, source_host, dest_host):
+        rclone_bin = Path(self.rclone_bin).name if source_host else self.rclone_bin
+        config = absolute_path(args.rclone_config) if source_host else local_path(args.rclone_config)
+        command = [rclone_bin, 'copy', '-v', '--transfers', str(self.threads),
+                   '--config', str(config), '--files-from-raw', '-']
+        return finish_transfer_command(command, args, source, dest, source_host)
+
+
+def finish_transfer_command(command, args, source, dest, source_host):
     if args.dry_run:
         command.append('--dry-run')
     command += ['--', os.path.join(str(source), ''), dest]
@@ -403,7 +450,7 @@ def transfer_command(args, binary, source, dest, source_host, dest_host):
     return command
 
 
-def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, logs):
+def run_transfers(args, chunks, transfer, source, dest, source_hosts, dest_hosts, logs):
     source_cycle = itertools.cycle(source_hosts or [None])
     dest_cycle = itertools.cycle(dest_hosts or [None])
     jobs = iter(enumerate(chunks))
@@ -411,7 +458,7 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
     processes = []
     failures = []
     exhausted = False
-    tool = 'rclone' if args.cloud else 'rsync'
+    tool = transfer.name
     try:
         while active or not exhausted:
             while len(active) < args.number and not exhausted:
@@ -420,8 +467,8 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
                 except StopIteration:
                     exhausted = True
                     break
-                command = transfer_command(args, binary, source, dest,
-                                           next(source_cycle), next(dest_cycle))
+                command = transfer.build_command(args, source, dest,
+                                                 next(source_cycle), next(dest_cycle))
                 error_path = logs / '{}.err.{}'.format(tool, index)
                 with chunk.open('rb') as files, (logs / '{}.out.{}'.format(tool, index)).open('wb') as out, error_path.open('wb') as err:
                     process = start_process(command, processes, stdin=files, stdout=out, stderr=err)
@@ -446,6 +493,7 @@ def run_transfers(args, chunks, binary, source, dest, source_hosts, dest_hosts, 
 
 
 def run(args):
+    # Check paths and host lists before creating working files.
     source = local_path(args.source)
     working = local_path(args.working_dir)
     logs = local_path(args.log_output) if args.log_output else working / 'logs'
@@ -477,13 +525,21 @@ def run(args):
             raise SyncError('Source and destination directories must not overlap')
         if any(inside(path, destination) or inside(destination, path) for path in (working, logs)):
             raise SyncError('Working/log directories and the destination tree must not overlap')
+    # Choose the transfer tool; source workers use their own PATH.
     tool = 'rclone' if args.cloud else 'rsync'
     binary = tool if source_hosts else executable(tool)
+    if args.cloud:
+        transfer = Rclone(binary)
+    else:
+        transfer = Rsync(binary)
     if source_hosts or dest_hosts:
         executable('ssh')
+
+    file_ops = FilesystemOps(source, working, logs)
     with working_lock(working):
         logs.mkdir(parents=True, exist_ok=True)
-        chunks = prepare_chunks(args, source, working, logs)
+        # Generate chunks, or validate the saved file lists.
+        chunks = file_ops.prepare_chunks(args)
         print('-- {} {} chunk(s), up to {} concurrent transfers'.format(
             'Reusing' if args.reuse else 'Prepared', len(chunks), args.number), flush=True)
         if args.dry_run:
@@ -493,8 +549,9 @@ def run(args):
             return
         if not args.cloud and not dest_hosts and not source_hosts and not args.dry_run:
             Path(dest).mkdir(parents=True, exist_ok=True)
+        # Copy the chunks and wait for every transfer to finish.
         transfer_source = absolute_path(args.source) if source_hosts else source
-        run_transfers(args, chunks, binary, transfer_source, dest, source_hosts, dest_hosts, logs)
+        run_transfers(args, chunks, transfer, transfer_source, dest, source_hosts, dest_hosts, logs)
         print('-- {} completed successfully; logs: {}'.format('Dry run' if args.dry_run else 'Transfer', logs))
 
 
